@@ -2851,7 +2851,7 @@ with gr.Blocks(
           <div class="guide-card">
             <div class="guide-step">Step 4</div>
             <h3>Generate contours and validate them</h3>
-            <p>The final run writes the contours, then compares each structure and cluster against matched spatial null models. You receive PASS/PARTIAL/FAIL calls, HOTSPOT roles, and tree-consistent split suggestions.</p>
+            <p>The final run writes the contours, then compares each structure and only its assigned clusters against matched spatial null models. Foreign and unassigned clusters are excluded. You receive PASS/PARTIAL/FAIL calls, assigned-cluster HOTSPOT calls, and tree-consistent split suggestions.</p>
           </div>
         </div>
         <div class="app-note">

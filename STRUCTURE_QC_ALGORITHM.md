@@ -3,7 +3,7 @@
 输入一个 HistoSeg 输出 zip（或解压后的文件夹），自动给出：
 
 1. 每个结构是否分割成功（PASS / PARTIAL / FAIL）
-2. 每个结构内部是否存在高度聚集的 cluster（HOTSPOT），以及它们的角色
+2. 分配给每个结构的 cluster 中是否存在高度聚集的亚区（HOTSPOT）
 3. 是否建议进一步分割，并按原始 StructureMap 树状图给出可直接回填 HistoSeg 的新 `cluster_ids` 分组
 
 ```bash
@@ -30,7 +30,7 @@ python histoseg_csr_qc.py "histoseg_outputs - 2026-09-16T110313.955.zip" --struc
 | 零模型 | 模拟方式 | 回答的问题 |
 |---|---|---|
 | `csr` | 在 W 内均匀撒 n 个点 | 相对完全空间随机是否聚集 |
-| `rl`（随机标记） | 从该结构全部细胞中无放回抽 n 个 | 排除结构自身密度不均后，该 cluster 是否仍聚集 |
+| `rl`（随机标记） | 仅从分配给该结构的 cluster 细胞中无放回抽 n 个 | 排除已分配结构自身密度不均后，该 cluster 是否仍聚集 |
 
 **偏离指数** DI = mean over r∈[20, 100] µm of L_obs(r) / L_null(r) − 1
 （DI > 0 聚集，≈ 0 随机，< 0 均匀）。r < 20 µm 受细胞体积硬核效应影响，不计入。
@@ -44,31 +44,28 @@ python histoseg_csr_qc.py "histoseg_outputs - 2026-09-16T110313.955.zip" --struc
 ### 步骤 2 — 结构判定
 | 指标 | 点集 | 窗口 | 零模型 |
 |---|---|---|---|
-| DI_tissue | 结构内全部细胞 | 整个组织 | csr |
-| DI_in | 结构内全部细胞 | 自身结构 | csr |
+| DI_tissue | 结构轮廓内、且 cluster 被分配给该结构的全部细胞 | 整个组织 | csr |
+| DI_in | 结构轮廓内、且 cluster 被分配给该结构的全部细胞 | 自身结构 | csr |
 
 - **FAIL**：DI_tissue 不显著（结构细胞在组织中并不集中）
 - **PASS**：DI_in ≤ 0.10（轮廓内接近随机，轮廓解释了聚集）
 - **PARTIAL**：0.10 < DI_in ≤ 0.30
 - **FAIL**：DI_in > 0.30（轮廓内仍强烈聚集）
 
+**单 cluster 硬规则：** 如果一个结构只分配了 1 个 cluster，则该结构直接判定为 `PASS`，
+并设为 `split = NOT_NEEDED`；DI 指标仍输出供参考，但不用于推翻该判定。
+
 EF = 1 − DI_in / DI_tissue 只作参考，不参与判定：面积占比大的结构 DI_tissue 天然偏小，会使 EF 偏低。
 
 ### 步骤 3 — 结构内 cluster
-对结构 s 内每个 cluster（≥ 100 个细胞且占结构 ≥ 1%），计算 DI_csr 与 DI_rl。
+只对 StructureMap 分配给结构 s 的 cluster（在该结构轮廓内 ≥ 100 个细胞且占已分配细胞 ≥ 1%）计算 DI_csr 与 DI_rl。
+落入该轮廓但属于其他结构或未分配的 cluster，不进入点集、随机标记背景、比例分母或图表。
 
 - **HOTSPOT**：DI_rl ≥ 0.30、DI_csr ≥ 0.30，且 p_rl ≤ 0.05
 - **CLUSTERED**：DI_rl ≥ 0.15，且 p_rl ≤ 0.05
 - **DISPERSED** / **RANDOM-LIKE**：其余情况
 
-HOTSPOT 再按“是否属于本结构”和“距轮廓比”分角色。
-距轮廓比 = 该 cluster 细胞到结构边界距离的中位数 ÷ 结构全部细胞的对应中位数。
-
-| 角色 | 条件 | 含义 |
-|---|---|---|
-| SUBDOMAIN | 属于本结构 | 本结构内部的亚区，分割候选 |
-| EMBEDDED_FOREIGN | 属于其他结构，距轮廓比 > 0.6 | 结构内部未被切出的外来岛，分割候选 |
-| BOUNDARY_SPILLOVER | 属于其他结构，距轮廓比 ≤ 0.6 | 贴着轮廓的溢入细胞，属于轮廓精度问题，**不**作为分割依据 |
+HOTSPOT 均来自本结构已分配 cluster，并标记为 `SUBDOMAIN`；其他结构的 cluster 不再参与本结构 QC。
 
 ### 步骤 4 — 分割建议（CSR 决定“是否分”，原始 StructureMap 决定“怎么分”）
 不自己计算任何 cluster 间距离或共定位，直接使用同一次 HistoSeg 运行的 **原始 StructureMap 矩阵**

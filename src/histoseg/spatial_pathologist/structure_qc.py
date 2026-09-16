@@ -15,9 +15,9 @@ Algorithm (details in README.md)
   1. Engine     Ripley's L on a fixed r grid + Clark-Evans NND, compared with Monte
                 Carlo nulls in the SAME window (edge effects cancel):
                   null "csr" = uniform points in the window
-                  null "rl"  = random labelling: n points drawn from all cells of the
-                               structure (controls for the structure's own density
-                               inhomogeneity)
+                  null "rl"  = random labelling: n points drawn only from cells whose
+                               clusters are assigned to the structure (controls for the
+                               assigned structure's own density inhomogeneity)
                 DI (deviation index) = mean_{r_min<=r<=r_max} L_obs(r)/L_null(r) - 1
                   DI > 0 clustered, DI ~ 0 random, DI < 0 regular.
   2. Structure  DI_tissue (structure cells, tissue window, csr)
@@ -26,11 +26,10 @@ Algorithm (details in README.md)
                 DI_in <= t_homog_pass PASS, <= t_homog_partial PARTIAL, else FAIL.
                 EF = 1 - max(DI_in, 0) / DI_tissue is reported only (it is biased
                 low for structures covering most of the tissue).
-  3. Cluster    for every cluster inside a structure: DI_csr and DI_rl
+  3. Cluster    for every cluster assigned to a structure: DI_csr and DI_rl
                 HOTSPOT if DI_rl >= t_hotspot, DI_csr >= t_hotspot, p_rl <= alpha
-                role: home hotspot -> SUBDOMAIN; foreign hotspot hugging the contour ->
-                BOUNDARY_SPILLOVER (contour QC, not a split); foreign hotspot in the
-                interior -> EMBEDDED_FOREIGN (uncarved island, split candidate)
+                Only the structure's assigned clusters are tested; foreign clusters
+                spatially falling inside its contour are excluded from all calculations.
   4. Split      CSR decides WHETHER to split, the original StructureMap decides HOW.
                 The structure's clusters are taken from the StructureMap as given (no
                 distances are recomputed; the ultrametric cophenetic matrix defines the
@@ -267,7 +266,10 @@ def run_test(job):
     mask = labels > 0 if window == "tissue" else labels == sid
     pix_iy, pix_ix = np.nonzero(mask)
     area = pix_iy.size * (xe[1] - xe[0]) * (ye[1] - ye[0])
-    in_s = G["sid"] == sid
+    # A structure is represented only by cells from clusters explicitly assigned to it.
+    # Spatially overlapping cells from foreign/unassigned clusters are not candidates and
+    # are not part of the random-labelling background pool.
+    in_s = (G["sid"] == sid) & (G["home_sid"] == sid)
     sel = in_s if cluster is None else in_s & (G["cluster"] == cluster)
     rng = np.random.default_rng(_seed(key))
     xy = G["xy"][sel]
@@ -340,25 +342,33 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
     R = np.arange(P["r_step"], P["r_max"] + 1e-9, P["r_step"])
     band = (R >= P["r_min"]) & (R <= P["r_max"])
     sid_arr = cells.isoline_structure_id.to_numpy()
-    cl_arr = cells.cluster.to_numpy()
+    cl_arr = cells.cluster.map(_norm_label).to_numpy(object)
     xy_all = cells[["x_centroid", "y_centroid"]].to_numpy(float)
     pix_area = (xe[1] - xe[0]) * (ye[1] - ye[0])
 
     specs = {int(s["structure_id"]): s for s in meta["selected_structures"]}
-    home = {str(c): sid for sid, s in specs.items() for c in s["cluster_ids"]}
+    home = {_norm_label(c): sid for sid, s in specs.items() for c in s["cluster_ids"]}
+    home_sid_arr = np.asarray([home.get(c, 0) for c in cl_arr], dtype=int)
     jobs, cluster_rows = [], []
     for sid in specs:
         jobs += [(f"S{sid}|all|tissue|csr", sid, None, "tissue", "csr"),
                  (f"S{sid}|all|structure|csr", sid, None, "structure", "csr")]
-        n_s = int((sid_arr == sid).sum())
-        vc = pd.Series(cl_arr[sid_arr == sid]).value_counts()
+        eligible = (sid_arr == sid) & (home_sid_arr == sid)
+        n_s = int(eligible.sum())
+        if n_s == 0:
+            raise ValueError(
+                f"Structure S{sid} has no cells from its assigned clusters inside its partition. "
+                "Check the StructureMap cluster assignment and HistoSeg partition outputs."
+            )
+        vc = pd.Series(cl_arr[eligible]).value_counts()
         for c, n in vc.items():
             if n >= P["min_cells"] and n / n_s >= P["min_share"]:
                 cluster_rows.append((sid, c, int(n), n / n_s))
                 jobs += [(f"S{sid}|C{c}|structure|csr", sid, c, "structure", "csr"),
                          (f"S{sid}|C{c}|structure|rl", sid, c, "structure", "rl")]
     print(f"[engine] {len(jobs)} Monte Carlo tests x {P['n_sim']} simulations, {workers} workers")
-    state = dict(labels=labels, xe=xe, ye=ye, xy=xy_all, sid=sid_arr, cluster=cl_arr, P=P, R=R, band=band)
+    state = dict(labels=labels, xe=xe, ye=ye, xy=xy_all, sid=sid_arr,
+                 cluster=cl_arr, home_sid=home_sid_arr, P=P, R=R, band=band)
     with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(state,)) as ex:
         res = {r["key"]: r for r in ex.map(run_test, jobs)}
     tests = pd.DataFrame(res.values())
@@ -370,7 +380,7 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
     crow = []
     for sid, c, n, share in cluster_rows:
         a, b = res[f"S{sid}|C{c}|structure|csr"], res[f"S{sid}|C{c}|structure|rl"]
-        crow.append(dict(structure_id=sid, cluster=c, home_structure=home.get(c), is_home=home.get(c) == sid,
+        crow.append(dict(structure_id=sid, cluster=c, home_structure=home.get(c), is_home=True,
                          n_in_structure=n, share_of_structure=share,
                          frac_of_cluster_here=n / int((cl_arr == c).sum()),
                          DI_csr=a["DI"], p_csr=a["p_clustered"], CE_R_csr=a["CE_R"],
@@ -382,14 +392,12 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
     d_cell = np.zeros(len(cells))
     for sid in specs:
         edt = ndi.distance_transform_edt(labels == sid, sampling=(ye[1] - ye[0], xe[1] - xe[0]))
-        m = sid_arr == sid
+        m = (sid_arr == sid) & (home_sid_arr == sid)
         d_cell[m] = edt[iy[m], ix[m]]
-    med_s = {sid: np.median(d_cell[sid_arr == sid]) for sid in specs}
+    med_s = {sid: np.median(d_cell[(sid_arr == sid) & (home_sid_arr == sid)]) for sid in specs}
     cdf["edge_ratio"] = [np.median(d_cell[(sid_arr == r.structure_id) & (cl_arr == r.cluster)]) / med_s[r.structure_id]
                          for r in cdf.itertuples()]
-    cdf["role"] = [("SUBDOMAIN" if r.is_home else
-                    "BOUNDARY_SPILLOVER" if r.edge_ratio <= P["t_edge"] else "EMBEDDED_FOREIGN")
-                   if r.status == "HOTSPOT" else "" for r in cdf.itertuples()]
+    cdf["role"] = ["SUBDOMAIN" if r.status == "HOTSPOT" else "" for r in cdf.itertuples()]
 
     # structures and split suggestions (dendrogram of the original StructureMap)
     srow, suggestions = [], []
@@ -397,15 +405,20 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
         tis, ins = res[f"S{sid}|all|tissue|csr"], res[f"S{sid}|all|structure|csr"]
         verdict, ef, reason = structure_verdict(ins["DI"], tis["DI"], tis["p_clustered"], P)
         sc = cdf[cdf.structure_id == sid]
-        n_s = int((sid_arr == sid).sum())
+        n_s = int(((sid_arr == sid) & (home_sid_arr == sid)).sum())
         home_ids = [_norm_label(c) for c in spec["cluster_ids"]]
-        own = cells.cluster.map(_norm_label).isin(home_ids).to_numpy()
+        single_cluster = len(set(home_ids)) == 1
+        if single_cluster:
+            verdict = "PASS"
+            reason = "single assigned cluster; accepted by definition"
+        own = home_sid_arr == sid
         subdom = sc[sc.role == "SUBDOMAIN"]
         islands = sc[sc.role == "EMBEDDED_FOREIGN"]
         big_islands = islands[islands.share_of_structure >= P["min_group_share"]]
         spill = sc[sc.role == "BOUNDARY_SPILLOVER"]
         area = (labels == sid).sum() * pix_area
-        share = {_norm_label(k): v / n_s for k, v in pd.Series(cl_arr[sid_arr == sid]).value_counts().items()}
+        eligible = (sid_arr == sid) & own
+        share = {_norm_label(k): v / n_s for k, v in pd.Series(cl_arr[eligible]).value_counts().items()}
         di_rl = {_norm_label(k): v for k, v in sc.set_index("cluster").DI_rl.items()}
         hot_ids = {_norm_label(c) for c in subdom.cluster}
 
@@ -422,8 +435,10 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
                 g["share"] = float(sum(share.get(c, 0.0) for c in g["clusters"]))
                 g["max_DI_rl"] = float(np.nanmax([di_rl.get(c, np.nan) for c in g["clusters"]] + [-np.inf]))
                 g["small"] = g["share"] < P["min_group_share"]
-        can_split = bool(hot_ids) and (groups is None or len(groups) > 1)
-        if verdict != "PASS" and (can_split or len(big_islands)):
+        can_split = (not single_cluster) and bool(hot_ids) and (groups is None or len(groups) > 1)
+        if single_cluster:
+            split = "NOT_NEEDED"
+        elif verdict != "PASS" and (can_split or len(big_islands)):
             split = "RECOMMENDED"
         elif verdict == "PASS" and can_split and subdom.DI_rl.max() >= 2 * P["t_hotspot"]:
             split = "OPTIONAL"
@@ -565,11 +580,11 @@ def plot_overview(out_dir, sdf, cdf, P):
     ax2.axvline(P["t_hotspot"], color="#d03b3b", lw=1, ls="--")
     ax2.axvline(0, color="#6b6a64", lw=1)
     ax2.set_yticks(yy)
-    tag = {"SUBDOMAIN": "  [sub-domain]", "EMBEDDED_FOREIGN": "  [embedded island]", "BOUNDARY_SPILLOVER": "  [edge spill-over]"}
-    ax2.set_yticklabels([f"S{r.structure_id} · C{r.cluster}{'' if r.is_home else ' *'}  ({r.share_of_structure:.0%}){tag.get(r.role, '')}"
+    tag = {"SUBDOMAIN": "  [sub-domain]"}
+    ax2.set_yticklabels([f"S{r.structure_id} · C{r.cluster}  ({r.share_of_structure:.0%}){tag.get(r.role, '')}"
                          for r in c.itertuples()], fontsize=8)
-    ax2.set_xlabel("DI vs random labelling within structure (dashed = hotspot threshold; * = cluster selected for another structure)")
-    ax2.set_title("Clusters inside each structure", loc="left", fontsize=11)
+    ax2.set_xlabel("DI vs random labelling among clusters assigned to this structure (dashed = hotspot threshold)")
+    ax2.set_title("Assigned clusters within each structure", loc="left", fontsize=11)
     from matplotlib.patches import Patch
     ax2.legend(handles=[Patch(color=v, label=k) for k, v in scol.items()], frameon=False, fontsize=8, loc="lower right")
     for a in (ax, ax2):

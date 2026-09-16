@@ -10,7 +10,7 @@ two Xenium-derived input tables rather than from a precomputed HistoSeg ZIP:
 3. select one or more candidate structures;
 4. generate non-overlapping HistoSeg structure contours;
 5. automatically run fixed-window CSR and random-labelling QC;
-6. download PASS/PARTIAL/FAIL calls, cluster HOTSPOT roles, and tree-consistent
+6. download PASS/PARTIAL/FAIL calls, assigned-cluster HOTSPOT calls, and tree-consistent
    `cluster_ids` split suggestions with all ordinary HistoSeg outputs.
 
 The complete CSR method and thresholds are documented in
