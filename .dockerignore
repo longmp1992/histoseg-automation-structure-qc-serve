@@ -1,0 +1,10 @@
+.git
+.github
+__pycache__
+*.py[cod]
+.pytest_cache
+tests
+docs
+artifacts
+output
+project-vol

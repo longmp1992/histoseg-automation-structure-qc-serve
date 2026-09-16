@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "histoseg"
+dynamic = ["version"]
+description = "3D Xenium contour reconstruction toolkit with H&E image analysis and 2D spatial contour workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Taobo Hu", email = "taobo.hu@scilifelab.se" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scipy",
+    "scikit-image",
+    "scikit-learn",
+    "seaborn",
+    "shapely",
+    "matplotlib",
+    "networkx",
+    "openai>=1.0.0",
+    "Cell-GPS @ git+https://github.com/hutaobo/cellgps.git@main",
+]
+
+[project.optional-dependencies]
+he = [
+    "torch",
+    "transformers",
+    "accelerate",
+    "pillow",
+    "opencv-python-headless",
+    "rasterio",
+]
+threed = [
+    "anndata",
+    "pyXenium @ git+https://github.com/hutaobo/pyXenium.git",
+    "trimesh>=4.0.0",
+]
+vertical-qc = [
+    "ovrlpy",
+]
+viz = [
+    "pyvista>=0.43",
+    "imageio",
+]
+docs = [
+    "sphinx>=8",
+    "myst-nb",
+    "pydata-sphinx-theme>=0.16",
+    "sphinx-design",
+    "sphinx-copybutton",
+    "linkify-it-py",
+    "myst-parser",
+    "sphinx-rtd-theme",
+]
+serve = [
+    "gradio>=5.24,<6.0",
+]
+xenium-gui = [
+    "Cell-GPS[xenium,gui] @ git+https://github.com/hutaobo/cellgps.git@main",
+]
+
+[project.scripts]
+histoseg-gui = "histoseg.gui.gui_app:main"
+histoseg-ai-pathologist = "histoseg.spatial_pathologist.cli:main"
+histoseg-ai-pathologist-full-auto = "histoseg.spatial_pathologist.full_auto_cli:main"
+histoseg-ai-driven-spatial-pathologist-serve = "histoseg.spatial_pathologist.serve_app:main"
+histoseg-ai-driven-spatial-pathologist-run = "histoseg.spatial_pathologist.serve_cli:main"
+histoseg-he = "histoseg.he.cli:main"
+histoseg-contour = "histoseg.contour.cli:main"
+histoseg-3d = "histoseg.threed.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hutaobo/HistoSeg"
+Documentation = "https://histoseg.readthedocs.io"
+
+# Derive the package version from Git tags and write it into the version module.
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
+write_to = "src/histoseg/_version.py"
+
+# Reserved for future automated semantic-release publishing.
+[tool.semantic_release]
+branch = "main"
+tag_format = "v{version}"
+version_toml = ["pyproject.toml:project.version"]
+version_variables = ["src/histoseg/_version.py:__version__"]
