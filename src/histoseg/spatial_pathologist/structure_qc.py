@@ -270,7 +270,11 @@ def run_test(job):
     # Spatially overlapping cells from foreign/unassigned clusters are not candidates and
     # are not part of the random-labelling background pool.
     in_s = (G["sid"] == sid) & (G["home_sid"] == sid)
-    sel = in_s if cluster is None else in_s & (G["cluster"] == cluster)
+    if window == "tissue" and cluster is not None:
+        # original situation: all cells of the cluster, whole tissue, independent of the partition
+        sel = G["cluster"] == cluster
+    else:
+        sel = in_s if cluster is None else in_s & (G["cluster"] == cluster)
     rng = np.random.default_rng(_seed(key))
     xy = G["xy"][sel]
     n_full = len(xy)
@@ -366,6 +370,14 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
                 cluster_rows.append((sid, c, int(n), n / n_s))
                 jobs += [(f"S{sid}|C{c}|structure|csr", sid, c, "structure", "csr"),
                          (f"S{sid}|C{c}|structure|rl", sid, c, "structure", "rl")]
+    # original (whole tissue) vs final (own structure) DI for every assigned cluster
+    queued = {j[0] for j in jobs}
+    for c, sid in home.items():
+        if not (cl_arr == c).any():
+            continue
+        jobs.append((f"C{c}|original|tissue|csr", sid, c, "tissue", "csr"))
+        if f"S{sid}|C{c}|structure|csr" not in queued and ((sid_arr == sid) & (cl_arr == c)).sum() >= 3:
+            jobs.append((f"S{sid}|C{c}|structure|csr", sid, c, "structure", "csr"))
     print(f"[engine] {len(jobs)} Monte Carlo tests x {P['n_sim']} simulations, {workers} workers")
     state = dict(labels=labels, xe=xe, ye=ye, xy=xy_all, sid=sid_arr,
                  cluster=cl_arr, home_sid=home_sid_arr, P=P, R=R, band=band)
@@ -398,6 +410,23 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
     cdf["edge_ratio"] = [np.median(d_cell[(sid_arr == r.structure_id) & (cl_arr == r.cluster)]) / med_s[r.structure_id]
                          for r in cdf.itertuples()]
     cdf["role"] = ["SUBDOMAIN" if r.status == "HOTSPOT" else "" for r in cdf.itertuples()]
+    before_after = []
+    for c, sid in sorted(home.items(), key=lambda kv: (kv[1], _cluster_sort_key(kv[0]))):
+        orig = res.get(f"C{c}|original|tissue|csr")
+        if orig is None:
+            continue
+        final = res.get(f"S{sid}|C{c}|structure|csr")
+        n_c = int((cl_arr == c).sum())
+        n_in = int(((sid_arr == sid) & (cl_arr == c)).sum())
+        di_final = final["DI"] if final is not None else np.nan
+        before_after.append(dict(cluster=c, structure_id=sid, structure_name=specs[sid]["structure_name"],
+                                 n_cells=n_c, n_in_own_structure=n_in, frac_in_own_structure=n_in / max(n_c, 1),
+                                 DI_original_tissue=orig["DI"], DI_final_structure=di_final,
+                                 dDI=orig["DI"] - di_final))
+    before_after = pd.DataFrame(before_after, columns=[
+        "cluster", "structure_id", "structure_name", "n_cells", "n_in_own_structure", "frac_in_own_structure",
+        "DI_original_tissue", "DI_final_structure", "dDI"])
+    before_after.to_csv(out_dir / "qc_cluster_DI_before_after.csv", index=False)
 
     # structures and split suggestions (dendrogram of the original StructureMap)
     srow, suggestions = [], []
@@ -483,13 +512,57 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
                    structuremap=smap_src,
                    params=P, structures=suggestions),
               open(out_dir / "qc_split_suggestions.json", "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    write_report(out_dir, input_path, sdf, cdf, suggestions, P, win_source, match, smap_src)
-    plot_overview(out_dir, sdf, cdf, P)
+    write_report(out_dir, input_path, sdf, cdf, suggestions, P, win_source, match, smap_src, before_after)
+    plot_overview(out_dir, sdf, cdf, P, before_after)
     return sdf, cdf, suggestions
 
 
 # --------------------------------------------------------------------------- outputs
-def write_report(out_dir, input_path, sdf, cdf, suggestions, P, win_source, match, smap_src):
+def _cluster_sort_key(c):
+    s = str(c)
+    return (0, int(s), s) if s.isdigit() else (1, 0, s)
+
+
+def plot_cluster_di_before_after(ax, table, before_col, after_col, group_col, title):
+    """Grouped bars: DI of every cluster in the original tissue vs in its final structure."""
+    t = table.reset_index(drop=True)
+    x, pos, prev, sep = [], 0.0, None, []
+    for g in t[group_col]:
+        if prev is not None and g != prev:
+            sep.append(pos - 0.6)
+            pos += 0.6
+        x.append(pos)
+        pos += 1
+        prev = g
+    x = np.asarray(x)
+    w = 0.38
+    before = t[before_col].to_numpy(float)
+    after = t[after_col].to_numpy(float)
+    ax.bar(x - w / 2, before, width=w, color="#9c9b94", label="original: whole tissue", zorder=3)
+    ax.bar(x + w / 2, np.nan_to_num(after), width=w, color="#2a78d6", label="final: own structure", zorder=3)
+    for xi, a in zip(x, after):
+        if np.isnan(a):
+            ax.text(xi + w / 2, 0, "n/a", ha="center", va="bottom", fontsize=6, color="#6b6a64", rotation=90)
+    ax.axhline(0, color="#6b6a64", lw=1)
+    ax.axhline(0.3, color="#d03b3b", lw=1, ls="--", zorder=2)
+    for s in sep:
+        ax.axvline(s, color="#d6d5cf", lw=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"C{c}" for c in t["cluster"]], fontsize=8, rotation=90 if len(t) > 24 else 0)
+    top = np.nanmax(np.concatenate([before, after, [0.35]]))
+    for g, sub in t.groupby(group_col, sort=False):
+        xs = x[sub.index.to_numpy()]
+        ax.text(xs.mean(), top * 1.04, str(g), ha="center", va="bottom", fontsize=8, color="#4a4a45")
+    ax.set_ylim(min(0, np.nanmin(np.concatenate([before, after]))) * 1.1 - 0.02, top * 1.15)
+    ax.set_ylabel("DI vs CSR")
+    ax.set_title(title, loc="left", fontsize=11)
+    ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.005, 1.0))
+    ax.grid(axis="y", alpha=.25, lw=.6)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+
+
+def write_report(out_dir, input_path, sdf, cdf, suggestions, P, win_source, match, smap_src, before_after=None):
     zh = {"PASS": "成功", "PARTIAL": "部分成功", "FAIL": "不成功",
           "RECOMMENDED": "建议进一步分割", "OPTIONAL": "可选分割", "REVIEW": "需人工复核（异质但无主导聚集 cluster）",
           "NOT_NEEDED": "无需分割"}
@@ -514,6 +587,14 @@ def write_report(out_dir, input_path, sdf, cdf, suggestions, P, win_source, matc
     for r in cdf[cdf.status.isin(["HOTSPOT", "CLUSTERED"])].sort_values(["structure_id", "DI_rl"], ascending=[True, False]).itertuples():
         L.append(f"| S{r.structure_id} | C{r.cluster} | S{r.home_structure} | {r.n_in_structure:,} | {r.share_of_structure:.1%} | "
                  f"{r.DI_csr:.2f} | {r.DI_rl:.2f} | {r.CE_R_csr:.2f} | {r.edge_ratio:.2f} | {r.status} | {role_zh.get(r.role, '')} |")
+    if before_after is not None and len(before_after):
+        L += ["", "## 每个 cluster 的 DI：原始（整个组织）vs 最终（所属结构内）", "",
+              "| 结构 | Cluster | 细胞数 | 落在所属结构内 | DI 原始 | DI 最终 | ΔDI |", "|---|---|---|---|---|---|---|"]
+        for r in before_after.itertuples():
+            fin = "—" if pd.isna(r.DI_final_structure) else f"{r.DI_final_structure:.2f}"
+            dd = "—" if pd.isna(r.dDI) else f"{r.dDI:.2f}"
+            L.append(f"| {r.structure_name} | C{r.cluster} | {r.n_cells:,} | {r.frac_in_own_structure:.0%} | "
+                     f"{r.DI_original_tissue:.2f} | {fin} | {dd} |")
     L += ["", "## 分割建议", ""]
     for s in suggestions:
         L.append(f"### {s['structure_name']} — {zh[s['verdict']]} / {zh[s['split']]}")
@@ -546,15 +627,18 @@ def write_report(out_dir, input_path, sdf, cdf, suggestions, P, win_source, matc
     (out_dir / "qc_report.md").write_text("\n".join(L), encoding="utf-8")
 
 
-def plot_overview(out_dir, sdf, cdf, P):
+def plot_overview(out_dir, sdf, cdf, P, before_after=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     vcol = {"PASS": "#1baf7a", "PARTIAL": "#eda100", "FAIL": "#d03b3b"}
     scol = {"HOTSPOT": "#d03b3b", "CLUSTERED": "#eda100", "RANDOM-LIKE": "#b0b0a8", "DISPERSED": "#2a78d6"}
     n_s = len(sdf)
-    fig = plt.figure(figsize=(13, 1.2 + 0.55 * max(n_s, 1) + 0.28 * len(cdf)))
-    gs = fig.add_gridspec(2, 1, height_ratios=[0.55 * n_s + 0.6, 0.28 * len(cdf) + 0.8])
+    has_ba = before_after is not None and len(before_after) > 0
+    bar_h = 3.6 if has_ba else 0.0
+    fig = plt.figure(figsize=(13, 1.2 + 0.55 * max(n_s, 1) + 0.28 * len(cdf) + bar_h))
+    gs = fig.add_gridspec(3 if has_ba else 2, 1,
+                          height_ratios=[0.55 * n_s + 0.6, 0.28 * len(cdf) + 0.8] + ([bar_h] if has_ba else []))
     ax = fig.add_subplot(gs[0])
     y = -np.arange(n_s)
     for k, r in enumerate(sdf.itertuples()):
@@ -592,8 +676,13 @@ def plot_overview(out_dir, sdf, cdf, P):
             a.spines[sp].set_visible(False)
         a.grid(axis="x", alpha=.25, lw=.6)
     ax.axvspan(P["t_homog_pass"], P["t_homog_partial"], color="#eda100", alpha=.08, lw=0)
+    if has_ba:
+        ax3 = fig.add_subplot(gs[2])
+        plot_cluster_di_before_after(
+            ax3, before_after, "DI_original_tissue", "DI_final_structure", "structure_name",
+            "DI of every cluster: original (whole tissue) vs final (inside its assigned structure); dashed = 0.3")
     fig.tight_layout()
-    fig.savefig(out_dir / "qc_overview.png", dpi=170)
+    fig.savefig(out_dir / "qc_overview.png", dpi=170, bbox_inches="tight")
     plt.close(fig)
 
 

@@ -41,7 +41,7 @@ from scipy.cluster.hierarchy import dendrogram, linkage, to_tree
 from scipy.spatial.distance import squareform
 
 from .structure_qc import PARAMS as QC_PARAMS
-from .structure_qc import _L_nnd, _norm_label, _uniform_in_mask
+from .structure_qc import _L_nnd, _cluster_sort_key, _norm_label, _uniform_in_mask, plot_cluster_di_before_after
 
 DESCENDANT_RULES = ("extract_top_branch", "split_parent", "stop")
 PartitionFn = Callable[[list[list[str]]], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
@@ -61,6 +61,7 @@ class AutoSplitResult:
     files: list[Path]
     sum_di_baseline: float
     sum_di_final: float
+    before_after_png: Path
 
 
 # --------------------------------------------------------------------------- DI engine
@@ -364,13 +365,14 @@ def run_auto_split(
     say((total_steps - 0.5) / total_steps, "Writing report and figures")
     dendro_png = _plot_dendrogram(out_dir, M, Z, info, nodes, final_groups, min_ddi, descendant_rule)
     part_png = _plot_partition(out_dir, cells, x_col, y_col, assign_f, final_groups)
+    bars_png = _plot_before_after(out_dir, clusters)
     report = _write_report(out_dir, nodes, long, clusters, structures, pd.DataFrame(extract_rows), structure_lines,
                            min_ddi, descendant_rule, P, float(np.nansum(baseline)),
                            float(np.nansum(clusters.DI_after_final)))
-    files += [dendro_png, part_png, report]
+    files += [dendro_png, part_png, bars_png, report]
     say(1.0, "Automatic split finished")
     return AutoSplitResult(out_dir, nodes, long, clusters, structures, structure_lines, report, dendro_png, part_png,
-                           files, float(np.nansum(baseline)), float(np.nansum(clusters.DI_after_final)))
+                           files, float(np.nansum(baseline)), float(np.nansum(clusters.DI_after_final)), bars_png)
 
 
 def _json_default(o):
@@ -476,7 +478,28 @@ def _plot_dendrogram(out_dir, M, Z, info, nodes, final_groups, t, rule) -> Path:
         ax.spines[sp].set_visible(False)
     fig.tight_layout()
     path = Path(out_dir) / "autosplit_dendrogram.png"
-    fig.savefig(path, dpi=160)
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _plot_before_after(out_dir, clusters: pd.DataFrame) -> Path:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    t = clusters.copy()
+    t["_sid"] = t.final_structure.str.extract(r"(\d+)$")[0].astype(int)
+    t["_ck"] = t.cluster.map(_cluster_sort_key)
+    t = t.sort_values(["_sid", "_ck"]).reset_index(drop=True)
+    fig, ax = plt.subplots(figsize=(max(9, 0.45 * len(t) + 3), 4.2))
+    plot_cluster_di_before_after(ax, t, "DI_before_tissue", "DI_after_final", "final_structure",
+                                 "DI of every cluster: original (whole tissue) vs final (inside its split structure); "
+                                 "dashed = 0.3")
+    fig.tight_layout()
+    path = Path(out_dir) / "autosplit_cluster_DI_before_after.png"
+    fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return path
 

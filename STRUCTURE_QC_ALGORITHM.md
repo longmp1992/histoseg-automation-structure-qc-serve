@@ -98,6 +98,7 @@ HOTSPOT 均来自本结构已分配 cluster，并标记为 `SUBDOMAIN`；其他�
 | `qc_split_suggestions.json` | 机器可读的建议：树切分分支、新 `cluster_ids`、外来岛、边界溢入 |
 | `qc_tests.csv`, `qc_L_ratio_curves.csv` | 全部检验结果与 L 比值曲线 |
 | `partition_labels.npz` | 所用窗口栅格 |
+| `qc_cluster_DI_before_after.csv` | 每个已分配 cluster：原始 DI（全部细胞、整个组织）与最终 DI（所属结构轮廓内）；`qc_overview.png` 底部为对应的分组柱状图 |
 
 ## 默认阈值（均可调）
 `n_sim=49, r=[20,100] µm, t_homog_pass=0.10, t_homog_partial=0.30, t_hotspot=0.30, t_mild=0.15,
@@ -138,6 +139,7 @@ t_edge=0.60, min_group_share=0.05, min_cells=100, min_share=0.01, max_points=200
 | `autosplit_structures.csv`, `autosplit_histoseg_structures.txt` | 最终结构（每行一个，可直接用于步骤 2） |
 | `autosplit_extracted_branches.csv` | 被提取的子分支及各子支贡献 |
 | `autosplit_dendrogram.png`, `autosplit_partition.png` | 标注 ΔDI 与判定的树状图；最终结构的空间划分 |
+| `autosplit_cluster_DI_before_after.png` | 每个 cluster 原始（整个组织）与最终（所属结构内）DI 的分组柱状图 |
 
 ## 运行时间
 - **工作量：** 每个分支点需要 1 次 HistoSeg 划分，外加该分支点下 cluster 数 × 2 次 DI 检验。

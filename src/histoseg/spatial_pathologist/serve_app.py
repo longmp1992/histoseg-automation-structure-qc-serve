@@ -2627,6 +2627,7 @@ def run_auto_structure_split(
             "\n".join(status_lines),
             str(result.dendrogram_png),
             str(result.partition_png),
+            str(result.before_after_png),
             nodes_table,
             clusters_table,
             structures_table,
@@ -3250,6 +3251,10 @@ with gr.Blocks(
                 label="HistoSeg partition of the split structures", type="filepath", interactive=False, sources=[],
                 elem_id="autosplit-partition",
             )
+            autosplit_bars = gr.Image(
+                label="DI of every cluster: original (whole tissue) vs final (split structure)", type="filepath",
+                interactive=False, sources=[], elem_id="autosplit-bars",
+            )
             autosplit_structures_table = gr.Dataframe(
                 label="Automatically split structures", headers=AUTOSPLIT_STRUCTURE_COLUMNS, interactive=False, wrap=True
             )
@@ -3343,6 +3348,7 @@ with gr.Blocks(
             autosplit_status,
             autosplit_dendrogram,
             autosplit_partition,
+            autosplit_bars,
             autosplit_nodes_table,
             autosplit_clusters_table,
             autosplit_structures_table,
