@@ -31,6 +31,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import pickle
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
@@ -152,55 +153,66 @@ def _prepare_matrix(row_coph: pd.DataFrame, clusters_present: set[str]) -> pd.Da
 
 
 # --------------------------------------------------------------------------- main entry
-def run_auto_split(
+SPLIT_MODES = ("threshold", "n_structures")
+EXPLORATION_FILE = "autosplit_exploration.pkl"
+
+
+@dataclasses.dataclass
+class Exploration:
+    """Result of the (expensive) top-down exploration; cutting the tree only needs this."""
+
+    M: pd.DataFrame
+    baseline: pd.Series
+    nodes: pd.DataFrame
+    long: pd.DataFrame
+    contrib: dict[str, pd.Series]
+    params: dict[str, Any]
+
+    def save(self, path: Path) -> Path:
+        with open(path, "wb") as fh:
+            pickle.dump(dataclasses.asdict(self), fh)
+        return Path(path)
+
+    @classmethod
+    def load(cls, path: Path) -> "Exploration":
+        with open(path, "rb") as fh:
+            return cls(**pickle.load(fh))
+
+
+def explore_tree(
     cells: pd.DataFrame,
     row_coph: pd.DataFrame,
     partition_fn: PartitionFn,
-    out_dir: Path,
     *,
-    min_ddi: float = 1.0,
-    descendant_rule: str = "extract_top_branch",
     params: dict[str, Any] | None = None,
     workers: int = 1,
     x_col: str = "x_centroid",
     y_col: str = "y_centroid",
     progress: Callable[[float, str], None] | None = None,
-) -> AutoSplitResult:
-    """Explore every StructureMap branch point, then cut the tree at ``min_ddi``.
-
-    ``partition_fn(groups)`` must run HistoSeg with one structure per cluster group (structure ids 1..len(groups)
-    in the given order) and return ``(partition_labels, x_edges, y_edges, isoline_structure_id per cell)``.
-    """
-    if descendant_rule not in DESCENDANT_RULES:
-        raise ValueError(f"descendant_rule must be one of {DESCENDANT_RULES}")
+) -> Exploration:
+    """Baseline DI and ΔDI of every StructureMap branch point (HistoSeg re-partition after every split)."""
     P = {**QC_PARAMS, **(params or {})}
     say = progress or (lambda frac, msg: print(f"[auto_split] {msg}", flush=True))
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     cl_arr = cells["cluster"].map(_norm_label).to_numpy().astype(str)
     xy = cells[[x_col, y_col]].to_numpy(float)
     M = _prepare_matrix(row_coph, set(cl_arr))
     Z, root, info = build_tree(M)
-    by_name = {v["name"]: k for k, v in info.items()}
     n_internal = sum(1 for v in info.values() if v["children"])
-    total_steps = n_internal + 3
+    total_steps = n_internal + 1
 
-    # 1. baseline -------------------------------------------------------------------------------
-    say(0.01, "Partitioning the whole tissue (all clusters in one structure)")
+    say(0.0, "Partitioning the whole tissue (all clusters in one structure)")
     labels_t, xe_t, ye_t, _ = partition_fn([list(M.index)])
     tissue_labels = (np.asarray(labels_t) > 0).astype(np.int32)
-    say(1 / total_steps, f"Baseline DI of {len(M.index)} clusters in the whole tissue")
+    say(0.5 / total_steps, f"Baseline DI of {len(M.index)} clusters in the whole tissue")
     jobs = [(f"tissue|C{c}", np.flatnonzero(cl_arr == c), "tissue") for c in M.index]
     res = _run_jobs(jobs, tissue_labels, xe_t, ye_t, xy, P, workers)
     baseline = pd.Series({c: res[f"tissue|C{c}"]["DI"] for c in M.index}, name="DI_baseline_tissue")
     current = baseline.copy()
 
-    # 2. exploration ----------------------------------------------------------------------------
     # The partition is competitive: a group's contour moves when other groups are split. "Before" is therefore
     # re-measured in the partition that exists right before v is split (the previous step's partition).
     frontier = [root]
-    prev = None  # (labels, xe, ye, assign, gid_of) of the previous step; None = whole tissue (baseline)
+    prev = None
     node_rows, long_rows, contrib = [], [], {}
     step = 0
     while True:
@@ -211,8 +223,8 @@ def run_auto_split(
         step += 1
         frontier = [n for n in frontier if n != v] + info[v]["children"]
         groups = [info[n]["leaves"] for n in frontier]
-        say((1 + step) / total_steps, f"Branch point {info[v]['name']} ({step}/{n_internal}): HistoSeg partition "
-                                      f"with {len(groups)} structures")
+        say(step / total_steps, f"Branch point {info[v]['name']} ({step}/{n_internal}): HistoSeg partition "
+                                f"with {len(groups)} structures")
         labels, xe, ye, assign = partition_fn(groups)
         labels, assign = np.asarray(labels), np.asarray(assign)
         gid_of = {c: gid for gid, g in enumerate(groups, 1) for c in g}
@@ -246,14 +258,14 @@ def run_auto_split(
         node_rows.append(dict(node=info[v]["name"], exploration_step=step, height=info[v]["height"],
                               n_clusters=len(info[v]["leaves"]), clusters=",".join(info[v]["leaves"]),
                               children=" | ".join(",".join(info[ch]["leaves"]) for ch in info[v]["children"]),
-                              sum_DI_before=float(np.nansum(befores)),
-                              sum_DI_after=float(np.nansum(afters)),
+                              sum_DI_before=float(np.nansum(befores)), sum_DI_after=float(np.nansum(afters)),
                               dDI=float(np.nansum(list(d.values())))))
-
     nodes = pd.DataFrame(node_rows)
-    ddi = dict(zip(nodes.node, nodes.dDI))
+    nodes["dDI_rank"] = nodes.dDI.rank(ascending=False, method="first").astype(int)
+    return Exploration(M=M, baseline=baseline, nodes=nodes, long=pd.DataFrame(long_rows), contrib=contrib, params=P)
 
-    # 3. decision -------------------------------------------------------------------------------
+
+def _decide_threshold(info, root, ddi, contrib, min_ddi, descendant_rule):
     def internal_desc(k):
         out = []
         for ch in info[k]["children"]:
@@ -308,15 +320,99 @@ def run_auto_split(
                                  kind="kept branch" + (" minus extracted branches" if extracted else "")))
 
     resolve(root)
+    return decisions, final_groups, extract_rows
+
+
+def _decide_n_structures(info, root, nodes, n_structures):
+    """Select branch points by descending ΔDI; a selected branch point pulls in its unselected ancestors."""
+    by_name = {v["name"]: k for k, v in info.items()}
+    parent = {ch: k for k, v in info.items() for ch in v["children"]}
+    target = int(n_structures) - 1
+    selected: dict[int, str] = {}
+    for r in nodes.sort_values(["dDI", "height"], ascending=[False, False]).itertuples():
+        if len(selected) >= target:
+            break
+        k = by_name[r.node]
+        if k in selected:
+            continue
+        need, a = [k], parent.get(k)
+        while a is not None and a not in selected:
+            need.append(a)
+            a = parent.get(a)
+        if len(selected) + len(need) > target:
+            continue
+        selected[k] = f"ΔDI rank {r.dDI_rank}"
+        for anc in need[1:]:
+            selected[anc] = f"ancestor of {r.node} (ΔDI rank {r.dDI_rank})"
+
+    decisions: dict[str, dict[str, Any]] = {}
+    final_groups: list[dict[str, Any]] = []
+
+    def resolve(k):
+        name = info[k]["name"]
+        if not info[k]["children"]:
+            final_groups.append(dict(source=name, clusters=list(info[k]["leaves"]), kind="single cluster"))
+            return
+        if k in selected:
+            decisions[name] = dict(decision="split", reason=selected[k])
+            for ch in info[k]["children"]:
+                resolve(ch)
+            return
+        decisions[name] = dict(decision="keep", reason="not among the selected top-ΔDI branch points")
+        final_groups.append(dict(source=name, clusters=list(info[k]["leaves"]), kind="kept branch"))
+
+    resolve(root)
+    return decisions, final_groups, []
+
+
+def cut_tree(
+    exploration: Exploration,
+    cells: pd.DataFrame,
+    partition_fn: PartitionFn,
+    out_dir: Path,
+    *,
+    mode: str = "threshold",
+    min_ddi: float = 1.0,
+    descendant_rule: str = "extract_top_branch",
+    n_structures: int = 5,
+    workers: int = 1,
+    x_col: str = "x_centroid",
+    y_col: str = "y_centroid",
+    progress: Callable[[float, str], None] | None = None,
+) -> AutoSplitResult:
+    """Cut the explored tree (by ΔDI threshold or by number of structures), re-partition and report."""
+    if mode not in SPLIT_MODES:
+        raise ValueError(f"mode must be one of {SPLIT_MODES}")
+    if descendant_rule not in DESCENDANT_RULES:
+        raise ValueError(f"descendant_rule must be one of {DESCENDANT_RULES}")
+    say = progress or (lambda frac, msg: print(f"[auto_split] {msg}", flush=True))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ex = exploration
+    P, M, baseline = ex.params, ex.M, ex.baseline
+    cl_arr = cells["cluster"].map(_norm_label).to_numpy().astype(str)
+    xy = cells[[x_col, y_col]].to_numpy(float)
+    Z, root, info = build_tree(M)
+    nodes = ex.nodes.drop(columns=[c for c in ("decision", "reason", "passes_threshold") if c in ex.nodes]).copy()
+    ddi = dict(zip(nodes.node, nodes.dDI))
+    n_leaves = len(M.index)
+
+    if mode == "threshold":
+        decisions, final_groups, extract_rows = _decide_threshold(info, root, ddi, ex.contrib, min_ddi, descendant_rule)
+        mode_text = f"ΔDI threshold {min_ddi:g}; {_RULE_TEXT[descendant_rule]}"
+    else:
+        n_structures = int(min(max(1, n_structures), n_leaves))
+        decisions, final_groups, extract_rows = _decide_n_structures(info, root, nodes, n_structures)
+        mode_text = (f"{n_structures} structures: top-ranked ΔDI branch points "
+                     "(a selected branch point also splits its ancestors)")
     nodes["decision"] = nodes.node.map(lambda n: decisions.get(n, {}).get("decision", "not reached"))
     nodes["reason"] = nodes.node.map(lambda n: decisions.get(n, {}).get("reason", "inside a kept branch"))
     nodes["passes_threshold"] = nodes.dDI >= min_ddi
 
-    # 4. final partition ------------------------------------------------------------------------
     order = sorted(range(len(final_groups)), key=lambda i: (-len(final_groups[i]["clusters"]), final_groups[i]["source"]))
     final_groups = [final_groups[i] for i in order]
     groups = [g["clusters"] for g in final_groups]
-    say((total_steps - 1) / total_steps, f"Final HistoSeg partition with {len(groups)} structures and DI of every cluster")
+    say(0.1, f"Final HistoSeg partition with {len(groups)} structures and DI of every cluster")
     labels_f, xe_f, ye_f, assign_f = partition_fn(groups)
     assign_f = np.asarray(assign_f)
     jobs = [(f"final|C{c}", np.flatnonzero((cl_arr == c) & (assign_f == gid)), gid)
@@ -343,8 +439,7 @@ def run_auto_split(
     structures = pd.DataFrame(srow)
     structure_lines = "\n".join(",".join(g["clusters"]) for g in final_groups)
 
-    # outputs -----------------------------------------------------------------------------------
-    long = pd.DataFrame(long_rows)
+    long = ex.long
     files = []
     for df, name in ((nodes, "autosplit_branch_points.csv"), (long, "autosplit_branch_point_cluster_DI.csv"),
                      (clusters, "autosplit_cluster_DI_before_after.csv"), (structures, "autosplit_structures.csv"),
@@ -353,26 +448,67 @@ def run_auto_split(
         files.append(out_dir / name)
     (out_dir / "autosplit_histoseg_structures.txt").write_text(structure_lines + "\n", encoding="utf-8")
     np.savez_compressed(out_dir / "autosplit_partition_labels.npz", labels=labels_f, x_edges=xe_f, y_edges=ye_f)
+    s0, s1 = float(np.nansum(baseline)), float(np.nansum(clusters.DI_after_final))
     with open(out_dir / "autosplit_result.json", "w", encoding="utf-8") as fh:
-        json.dump(dict(min_dDI=min_ddi, descendant_rule=descendant_rule, params=P,
-                       sum_DI_baseline=float(np.nansum(baseline)), sum_DI_final=float(np.nansum(clusters.DI_after_final)),
+        json.dump(dict(mode=mode, mode_text=mode_text, min_dDI=min_ddi, descendant_rule=descendant_rule,
+                       n_structures=len(final_groups), params=P, sum_DI_baseline=s0, sum_DI_final=s1,
                        structures=[dict(structure_id=i, cluster_ids=g["clusters"], source=g["source"], kind=g["kind"])
                                    for i, g in enumerate(final_groups, 1)],
                        extracted_branches=extract_rows),
                   fh, indent=2, ensure_ascii=False, default=_json_default)
     files += [out_dir / "autosplit_histoseg_structures.txt", out_dir / "autosplit_partition_labels.npz",
               out_dir / "autosplit_result.json"]
-    say((total_steps - 0.5) / total_steps, "Writing report and figures")
-    dendro_png = _plot_dendrogram(out_dir, M, Z, info, nodes, final_groups, min_ddi, descendant_rule)
+    say(0.8, "Writing report and figures")
+    dendro_png = _plot_dendrogram(out_dir, M, Z, info, nodes, final_groups, mode_text)
     part_png = _plot_partition(out_dir, cells, x_col, y_col, assign_f, final_groups)
     bars_png = _plot_before_after(out_dir, clusters)
     report = _write_report(out_dir, nodes, long, clusters, structures, pd.DataFrame(extract_rows), structure_lines,
-                           min_ddi, descendant_rule, P, float(np.nansum(baseline)),
-                           float(np.nansum(clusters.DI_after_final)))
+                           mode_text, mode, min_ddi, P, s0, s1)
     files += [dendro_png, part_png, bars_png, report]
+    if (out_dir / EXPLORATION_FILE).exists():
+        files.append(out_dir / EXPLORATION_FILE)
     say(1.0, "Automatic split finished")
     return AutoSplitResult(out_dir, nodes, long, clusters, structures, structure_lines, report, dendro_png, part_png,
-                           files, float(np.nansum(baseline)), float(np.nansum(clusters.DI_after_final)), bars_png)
+                           files, s0, s1, bars_png)
+
+
+def run_auto_split(
+    cells: pd.DataFrame,
+    row_coph: pd.DataFrame,
+    partition_fn: PartitionFn,
+    out_dir: Path,
+    *,
+    mode: str = "threshold",
+    min_ddi: float = 1.0,
+    descendant_rule: str = "extract_top_branch",
+    n_structures: int = 5,
+    params: dict[str, Any] | None = None,
+    workers: int = 1,
+    x_col: str = "x_centroid",
+    y_col: str = "y_centroid",
+    progress: Callable[[float, str], None] | None = None,
+    exploration: Exploration | None = None,
+) -> AutoSplitResult:
+    """Explore every StructureMap branch point (unless ``exploration`` is given), then cut the tree.
+
+    ``partition_fn(groups)`` must run HistoSeg with one structure per cluster group (structure ids 1..len(groups)
+    in the given order) and return ``(partition_labels, x_edges, y_edges, isoline_structure_id per cell)``.
+    ``mode="threshold"`` cuts at ``min_ddi`` (with ``descendant_rule``); ``mode="n_structures"`` splits the
+    top-ranked ΔDI branch points (plus their ancestors) until ``n_structures`` structures exist.
+    """
+    say = progress or (lambda frac, msg: print(f"[auto_split] {msg}", flush=True))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if exploration is None:
+        exploration = explore_tree(cells, row_coph, partition_fn, params=params, workers=workers, x_col=x_col,
+                                   y_col=y_col, progress=lambda f, m: say(0.9 * f, m))
+        exploration.save(out_dir / EXPLORATION_FILE)
+        cut_progress = lambda f, m: say(0.9 + 0.1 * f, m)  # noqa: E731
+    else:
+        cut_progress = say
+    return cut_tree(exploration, cells, partition_fn, out_dir, mode=mode, min_ddi=min_ddi,
+                    descendant_rule=descendant_rule, n_structures=n_structures, workers=workers, x_col=x_col,
+                    y_col=y_col, progress=cut_progress)
 
 
 def _json_default(o):
@@ -400,10 +536,9 @@ def _f(x, fmt="{:.2f}"):
         return str(x)
 
 
-def _write_report(out_dir, nodes, long, clusters, structures, extracted, lines, t, rule, P, s0, s1) -> Path:
+def _write_report(out_dir, nodes, long, clusters, structures, extracted, lines, mode_text, mode, t, P, s0, s1) -> Path:
     L = ["# Automatic structure split by ΔDI", "",
-         f"- ΔDI threshold: **{t:g}**",
-         f"- Rule: {_RULE_TEXT[rule]}",
+         f"- Split rule: **{mode_text}**",
          f"- DI = mean over {int(P['r_min'])}–{int(P['r_max'])} µm of L_obs / L_CSR − 1; "
          f"{P['n_sim']} Monte Carlo simulations; up to {P['max_points']} points per test",
          f"- Σ DI over clusters: {s0:.2f} (whole tissue) → {s1:.2f} (final structures)", "",
@@ -414,11 +549,14 @@ def _write_report(out_dir, nodes, long, clusters, structures, extracted, lines, 
         L.append(f"| {r.structure_name} | {r.source} | {r.kind} | {r.cluster_ids} | {r.n_cells:,} | "
                  f"{_f(r.sum_DI_before_tissue)} | {_f(r.sum_DI_after_final)} | {_f(r.max_DI_after_final)} |")
     L += ["", "## ΔDI of every branch point", "",
-          "| Branch point | Height | Children | Σ DI before | Σ DI after | ΔDI | ≥ threshold | Decision | Reason |",
-          "|---|---|---|---|---|---|---|---|---|"]
+          "| Branch point | Height | Children | Σ DI before | Σ DI after | ΔDI | ΔDI rank | "
+          + ("≥ threshold | " if mode == "threshold" else "") + "Decision | Reason |",
+          "|---|---|---|---|---|---|---|" + ("---|" if mode == "threshold" else "") + "---|---|"]
     for r in nodes.itertuples():
         L.append(f"| {r.node} | {r.height:.3f} | {r.children} | {_f(r.sum_DI_before)} | {_f(r.sum_DI_after)} | "
-                 f"**{_f(r.dDI)}** | {'yes' if r.passes_threshold else 'no'} | {r.decision} | {r.reason} |")
+                 f"**{_f(r.dDI)}** | {r.dDI_rank} | "
+                 + (f"{'yes' if r.passes_threshold else 'no'} | " if mode == "threshold" else "")
+                 + f"{r.decision} | {r.reason} |")
     if len(extracted):
         L += ["", "## Extracted branches", "",
               "| Parent | Parent ΔDI | Qualifying descendant | Descendant ΔDI | Extracted | Branch contributions |",
@@ -443,7 +581,7 @@ def _write_report(out_dir, nodes, long, clusters, structures, extracted, lines, 
     return path
 
 
-def _plot_dendrogram(out_dir, M, Z, info, nodes, final_groups, t, rule) -> Path:
+def _plot_dendrogram(out_dir, M, Z, info, nodes, final_groups, mode_text) -> Path:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -467,11 +605,11 @@ def _plot_dendrogram(out_dir, M, Z, info, nodes, final_groups, t, rule) -> Path:
         v = by_name[r.node]
         marker, col = style[r.decision]
         ax.scatter(node_x(v), v["height"], s=120, marker=marker, color=col, edgecolor="white", lw=1, zorder=5)
-        ax.annotate(f"{r.node}\nΔ{r.dDI:+.2f}", (node_x(v), v["height"]), textcoords="offset points", xytext=(0, 8),
+        ax.annotate(f"{r.node} (#{r.dDI_rank})\nΔ{r.dDI:+.2f}", (node_x(v), v["height"]), textcoords="offset points", xytext=(0, 8),
                     ha="center", fontsize=7.5, color="#2b2b28" if r.decision != "not reached" else "#9a9990")
     ax.set_ylim(0, max(1.0, max(v["height"] for v in info.values())) * 1.13)
     ax.set_ylabel("cophenetic height (StructureMap)")
-    ax.set_title(f"ΔDI of every branch point; threshold {t:g} ({_RULE_TEXT[rule]})\n"
+    ax.set_title(f"ΔDI (and rank #) of every branch point; {mode_text}\n"
                  "● red = split   ✕ = kept together   grey = inside a kept branch; leaf colour = final structure",
                  loc="left", fontsize=9.5, pad=12)
     for sp in ("top", "right"):

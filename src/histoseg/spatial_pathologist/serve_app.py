@@ -66,6 +66,8 @@ from histoseg.spatial_pathologist.structure_qc import (
     PARAMS as STRUCTURE_QC_PARAMS,
     run as run_structure_qc,
 )
+from histoseg.spatial_pathologist.auto_split import EXPLORATION_FILE as AUTOSPLIT_EXPLORATION_FILE
+from histoseg.spatial_pathologist.auto_split import Exploration as AutoSplitExploration
 from histoseg.spatial_pathologist.auto_split import run_auto_split
 
 try:
@@ -2436,7 +2438,11 @@ AUTOSPLIT_RULE_CHOICES = {
     "Split the parent as well": "split_parent",
     "Keep the parent, ignore branch points below it": "stop",
 }
-AUTOSPLIT_NODE_COLUMNS = ["Branch point", "Height", "Children", "Σ DI before", "Σ DI after", "ΔDI", "≥ threshold",
+AUTOSPLIT_MODE_CHOICES = {
+    "ΔDI threshold": "threshold",
+    "Number of structures (split the top-ranked ΔDI branch points)": "n_structures",
+}
+AUTOSPLIT_NODE_COLUMNS = ["Branch point", "ΔDI rank", "Height", "Children", "Σ DI before", "Σ DI after", "ΔDI",
                           "Decision", "Reason"]
 AUTOSPLIT_CLUSTER_COLUMNS = ["Cluster", "Final structure", "Cells", "DI before (whole tissue)", "DI after (final)",
                              "ΔDI", "Fraction in own contour"]
@@ -2469,10 +2475,106 @@ def _round_or_blank(value: object, digits: int = 2) -> object:
     return "" if np.isnan(number) else round(number, digits)
 
 
+def _autosplit_partition_setup(cells_path: Path, clusters_path: Path, isoline_cfg: dict[str, object]):
+    merged, _id_col, x_col, y_col = prepare_merged_clusters(cells_path, clusters_path)
+    base_cells = merged[[x_col, y_col, "cluster"]].copy()
+    cluster_values = base_cells["cluster"].to_numpy()
+
+    def partition_fn(groups: list[list[str]]):
+        specs, selected = [], np.zeros(len(base_cells), dtype=int)
+        for gid, group in enumerate(groups, start=1):
+            specs.append(
+                {
+                    "structure_id": gid,
+                    "structure_name": f"Structure {gid}",
+                    "structure_color": group_color(gid),
+                    "cluster_ids_raw": list(group),
+                    "cluster_ids_normalized": list(group),
+                }
+            )
+            selected[np.isin(cluster_values, list(group))] = gid
+        frame = base_cells.copy()
+        frame["_selected_structure_id"] = selected
+        _contours, partition_data, _metrics = build_structure_isolines(
+            cells=frame, structure_specs=specs, x_col=x_col, y_col=y_col, isoline_cfg=isoline_cfg
+        )
+        assigned, _assign_metrics = assign_cells_to_partition(
+            cells=frame, partition_data=partition_data, structure_specs=specs, x_col=x_col, y_col=y_col
+        )
+        return (
+            partition_data["partition_labels"],
+            partition_data["x_edges"],
+            partition_data["y_edges"],
+            assigned["isoline_structure_id"].to_numpy(),
+        )
+
+    return merged, base_cells, x_col, y_col, partition_fn
+
+
+def _autosplit_split_kwargs(mode_label: str, n_structures: float, min_ddi: float, rule_label: str) -> dict[str, object]:
+    return {
+        "mode": AUTOSPLIT_MODE_CHOICES.get(str(mode_label), "threshold"),
+        "n_structures": int(n_structures),
+        "min_ddi": float(min_ddi),
+        "descendant_rule": AUTOSPLIT_RULE_CHOICES.get(str(rule_label), "extract_top_branch"),
+    }
+
+
+def _autosplit_outputs(result, run_dir: Path, header_lines: list[str], context: dict[str, object]):
+    archive_path = Path(shutil.make_archive(str(run_dir / "autosplit_outputs"), "zip", root_dir=result.out_dir))
+    nodes_table = pd.DataFrame(
+        [
+            [row.node, int(row.dDI_rank), round(row.height, 3), row.children, _round_or_blank(row.sum_DI_before),
+             _round_or_blank(row.sum_DI_after), _round_or_blank(row.dDI), row.decision, row.reason]
+            for row in result.nodes.sort_values("dDI_rank").itertuples()
+        ],
+        columns=AUTOSPLIT_NODE_COLUMNS,
+    )
+    clusters_table = pd.DataFrame(
+        [
+            [f"C{row.cluster}", row.final_structure, int(row.n_cells), _round_or_blank(row.DI_before_tissue),
+             _round_or_blank(row.DI_after_final), _round_or_blank(row.dDI), f"{row.frac_in_own_contour:.0%}"]
+            for row in result.clusters.sort_values("DI_before_tissue", ascending=False).itertuples()
+        ],
+        columns=AUTOSPLIT_CLUSTER_COLUMNS,
+    )
+    structures_table = pd.DataFrame(
+        [
+            [row.structure_name, row.cluster_ids, row.source, row.kind, int(row.n_cells),
+             _round_or_blank(row.sum_DI_before_tissue), _round_or_blank(row.sum_DI_after_final),
+             _round_or_blank(row.max_DI_after_final)]
+            for row in result.structures.itertuples()
+        ],
+        columns=AUTOSPLIT_STRUCTURE_COLUMNS,
+    )
+    status_lines = header_lines + [
+        f"Structures: {len(result.structures)}; Σ DI {result.sum_di_baseline:.2f} (whole tissue) -> "
+        f"{result.sum_di_final:.2f} (final structures).",
+        "Change the split rule / threshold / number of structures and click 'Re-split' to reuse this ΔDI exploration.",
+        "Click 'Use these structures in step 2' to copy them into the cluster-ID box and draw their contours.",
+    ]
+    return (
+        "\n".join(status_lines),
+        str(result.dendrogram_png),
+        str(result.partition_png),
+        str(result.before_after_png),
+        nodes_table,
+        clusters_table,
+        structures_table,
+        result.structure_lines,
+        result.report_md.read_text(encoding="utf-8"),
+        str(archive_path),
+        [str(path) for path in result.files],
+        context,
+    )
+
+
 def run_auto_structure_split(
     cells_parquet: object | None,
     clusters_csv: object | None,
     group_state: dict[str, object] | None,
+    mode_label: str,
+    n_structures: float,
     min_ddi: float,
     descendant_rule_label: str,
     n_sim: int,
@@ -2485,20 +2587,32 @@ def run_auto_structure_split(
     use_synth_bg: bool,
     progress: gr.Progress = gr.Progress(track_tqdm=False),
 ):
-    """Step 3: explore every StructureMap branch point with HistoSeg + CSR DI and cut the tree at a ΔDI threshold."""
+    """Step 3: explore every StructureMap branch point with HistoSeg + CSR DI, then split the tree."""
     if HISTOSEG_IMPORT_ERROR is not None:
         raise gr.Error(f"HistoSeg could not be imported inside the app container. Import error: {HISTOSEG_IMPORT_ERROR}")
     try:
+        started = time.perf_counter()
         removed_runs = cleanup_old_runs(max_keep=2)
         run_dir = build_run_dir()
         upload_dir = run_dir / "inputs"
         out_dir = run_dir / "autosplit"
         upload_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
         progress(0.01, desc="Staging uploaded files")
         cells_path, clusters_path, _unused = resolve_inputs(
             cells_upload=cells_parquet, clusters_upload=clusters_csv, tissue_upload=None, target_dir=upload_dir
         )
-        merged, _id_col, x_col, y_col = prepare_merged_clusters(cells_path, clusters_path)
+        isoline_cfg = {
+            **DEFAULT_STRUCTURE_ISOLINE_CFG,
+            "bins_x": int(grid_n),
+            "bins_y": int(knn_k),
+            "gaussian_sigma": float(smooth_sigma),
+            "min_cells": int(min_cells_inside),
+            "min_dominance": float(bbox_expand_um),
+            "support_quantile": float(syn_bg_density),
+            "fill_holes": bool(use_synth_bg),
+        }
+        merged, base_cells, x_col, y_col, partition_fn = _autosplit_partition_setup(cells_path, clusters_path, isoline_cfg)
         clusters_present = set(merged["cluster"].unique())
         if len(clusters_present) < 2:
             raise ValueError("Need at least two clusters to split.")
@@ -2513,56 +2627,12 @@ def run_auto_structure_split(
             row_coph, _col_coph = compute_cophenetic_from_distance_matrix(distance_matrix, method="average", show_corr=False)
             row_coph = normalize_row_cophenetic(row_coph)
             structuremap_source = "StructureMap computed for this run"
-        out_dir.mkdir(parents=True, exist_ok=True)
         row_coph.to_csv(out_dir / "cophenetic_heatmap_row_coph.csv", index_label="cluster")
 
-        isoline_cfg = {
-            **DEFAULT_STRUCTURE_ISOLINE_CFG,
-            "bins_x": int(grid_n),
-            "bins_y": int(knn_k),
-            "gaussian_sigma": float(smooth_sigma),
-            "min_cells": int(min_cells_inside),
-            "min_dominance": float(bbox_expand_um),
-            "support_quantile": float(syn_bg_density),
-            "fill_holes": bool(use_synth_bg),
-        }
-        base_cells = merged[[x_col, y_col, "cluster"]].copy()
-        cluster_values = base_cells["cluster"].to_numpy()
-
-        def partition_fn(groups: list[list[str]]):
-            specs, selected = [], np.zeros(len(base_cells), dtype=int)
-            for gid, group in enumerate(groups, start=1):
-                specs.append(
-                    {
-                        "structure_id": gid,
-                        "structure_name": f"Structure {gid}",
-                        "structure_color": group_color(gid),
-                        "cluster_ids_raw": list(group),
-                        "cluster_ids_normalized": list(group),
-                    }
-                )
-                selected[np.isin(cluster_values, list(group))] = gid
-            frame = base_cells.copy()
-            frame["_selected_structure_id"] = selected
-            _contours, partition_data, _metrics = build_structure_isolines(
-                cells=frame, structure_specs=specs, x_col=x_col, y_col=y_col, isoline_cfg=isoline_cfg
-            )
-            assigned, _assign_metrics = assign_cells_to_partition(
-                cells=frame, partition_data=partition_data, structure_specs=specs, x_col=x_col, y_col=y_col
-            )
-            return (
-                partition_data["partition_labels"],
-                partition_data["x_edges"],
-                partition_data["y_edges"],
-                assigned["isoline_structure_id"].to_numpy(),
-            )
-
-        rule = AUTOSPLIT_RULE_CHOICES.get(str(descendant_rule_label), "extract_top_branch")
+        split_kwargs = _autosplit_split_kwargs(mode_label, n_structures, min_ddi, descendant_rule_label)
         workers = _autosplit_workers()
-        n_clusters = len(clusters_present)
         log_event(
-            f"Auto split | clusters={n_clusters} | threshold={float(min_ddi):g} | rule={rule} | "
-            f"n_sim={int(n_sim)} | workers={workers}"
+            f"Auto split | clusters={len(clusters_present)} | split={split_kwargs} | n_sim={int(n_sim)} | workers={workers}"
         )
 
         def report_progress(frac: float, message: str) -> None:
@@ -2574,70 +2644,94 @@ def run_auto_structure_split(
             row_coph,
             partition_fn,
             out_dir,
-            min_ddi=float(min_ddi),
-            descendant_rule=rule,
             params={**STRUCTURE_QC_PARAMS, "n_sim": int(n_sim)},
             workers=workers,
             x_col=x_col,
             y_col=y_col,
             progress=report_progress,
+            **split_kwargs,
         )
         progress(0.98, desc="Packaging outputs")
-        archive_path = Path(shutil.make_archive(str(run_dir / "autosplit_outputs"), "zip", root_dir=out_dir))
-
-        nodes_table = pd.DataFrame(
-            [
-                [row.node, round(row.height, 3), row.children, _round_or_blank(row.sum_DI_before),
-                 _round_or_blank(row.sum_DI_after), _round_or_blank(row.dDI), "yes" if row.passes_threshold else "no",
-                 row.decision, row.reason]
-                for row in result.nodes.itertuples()
-            ],
-            columns=AUTOSPLIT_NODE_COLUMNS,
-        )
-        clusters_table = pd.DataFrame(
-            [
-                [f"C{row.cluster}", row.final_structure, int(row.n_cells), _round_or_blank(row.DI_before_tissue),
-                 _round_or_blank(row.DI_after_final), _round_or_blank(row.dDI), f"{row.frac_in_own_contour:.0%}"]
-                for row in result.clusters.sort_values("DI_before_tissue", ascending=False).itertuples()
-            ],
-            columns=AUTOSPLIT_CLUSTER_COLUMNS,
-        )
-        structures_table = pd.DataFrame(
-            [
-                [row.structure_name, row.cluster_ids, row.source, row.kind, int(row.n_cells),
-                 _round_or_blank(row.sum_DI_before_tissue), _round_or_blank(row.sum_DI_after_final),
-                 _round_or_blank(row.max_DI_after_final)]
-                for row in result.structures.itertuples()
-            ],
-            columns=AUTOSPLIT_STRUCTURE_COLUMNS,
-        )
-        status_lines = [
-            "Automatic ΔDI split finished.",
+        context = {
+            "run_dir": str(run_dir),
+            "out_dir": str(out_dir),
+            "cells_path": str(cells_path),
+            "clusters_path": str(clusters_path),
+            "isoline_cfg": isoline_cfg,
+            "n_clusters": len(clusters_present),
+        }
+        header = [
+            f"Automatic ΔDI split finished in {time.perf_counter() - started:.0f} s.",
             f"Run directory: {run_dir}",
-            f"{structuremap_source}; {n_clusters} clusters, {len(result.nodes)} branch points explored.",
-            f"Threshold ΔDI ≥ {float(min_ddi):g}; rule: {descendant_rule_label}.",
-            f"Structures: {len(result.structures)}; Σ DI {result.sum_di_baseline:.2f} (whole tissue) -> "
-            f"{result.sum_di_final:.2f} (final structures).",
-            "Click 'Use these structures' to copy them into the cluster-ID box, then run step 2 to draw the contours.",
+            f"{structuremap_source}; {len(clusters_present)} clusters, {len(result.nodes)} branch points explored "
+            f"({int(n_sim)} Monte Carlo simulations per DI test, {workers} worker(s)).",
+            f"Split rule: {mode_label}"
+            + (f" = {int(n_structures)}" if split_kwargs["mode"] == "n_structures"
+               else f" {float(min_ddi):g}; {descendant_rule_label}"),
         ]
         if removed_runs:
-            status_lines.append(f"Cleaned old run directories: {', '.join(removed_runs)}")
+            header.append(f"Cleaned old run directories: {', '.join(removed_runs)}")
         progress(1.0, desc="Automatic split finished")
-        return (
-            "\n".join(status_lines),
-            str(result.dendrogram_png),
-            str(result.partition_png),
-            str(result.before_after_png),
-            nodes_table,
-            clusters_table,
-            structures_table,
-            result.structure_lines,
-            result.report_md.read_text(encoding="utf-8"),
-            str(archive_path),
-            [str(path) for path in result.files],
-        )
+        return _autosplit_outputs(result, run_dir, header, context)
     except Exception as exc:
         log_event(f"Auto split failed: {exc}")
+        print(traceback.format_exc(), flush=True)
+        raise gr.Error(str(exc))
+
+
+def resplit_auto_structure_split(
+    context: dict[str, object] | None,
+    mode_label: str,
+    n_structures: float,
+    min_ddi: float,
+    descendant_rule_label: str,
+    progress: gr.Progress = gr.Progress(track_tqdm=False),
+):
+    """Re-cut the tree with new settings, reusing the ΔDI exploration of the last step-3 run."""
+    try:
+        if not context:
+            raise ValueError("Run '3. Split structures automatically by ΔDI' first; re-splitting reuses its ΔDI exploration.")
+        out_dir = Path(str(context["out_dir"]))
+        exploration_path = out_dir / AUTOSPLIT_EXPLORATION_FILE
+        if not exploration_path.exists():
+            raise ValueError("The ΔDI exploration of the last run is no longer available (old runs are cleaned up). "
+                             "Run step 3 again.")
+        started = time.perf_counter()
+        progress(0.02, desc="Loading the ΔDI exploration")
+        exploration = AutoSplitExploration.load(exploration_path)
+        _merged, base_cells, x_col, y_col, partition_fn = _autosplit_partition_setup(
+            Path(str(context["cells_path"])), Path(str(context["clusters_path"])), dict(context["isoline_cfg"])
+        )
+        split_kwargs = _autosplit_split_kwargs(mode_label, n_structures, min_ddi, descendant_rule_label)
+        log_event(f"Auto split re-cut | split={split_kwargs}")
+
+        def report_progress(frac: float, message: str) -> None:
+            progress(0.05 + 0.9 * float(frac), desc=message)
+
+        result = run_auto_split(
+            base_cells,
+            exploration.M,
+            partition_fn,
+            out_dir,
+            workers=_autosplit_workers(),
+            x_col=x_col,
+            y_col=y_col,
+            progress=report_progress,
+            exploration=exploration,
+            **split_kwargs,
+        )
+        header = [
+            f"Re-split finished in {time.perf_counter() - started:.0f} s (ΔDI exploration reused, "
+            f"{exploration.params['n_sim']} Monte Carlo simulations per DI test).",
+            f"Run directory: {context['run_dir']}",
+            f"Split rule: {mode_label}"
+            + (f" = {int(n_structures)}" if split_kwargs["mode"] == "n_structures"
+               else f" {float(min_ddi):g}; {descendant_rule_label}"),
+        ]
+        progress(1.0, desc="Re-split finished")
+        return _autosplit_outputs(result, Path(str(context["run_dir"])), header, context)
+    except Exception as exc:
+        log_event(f"Auto split re-cut failed: {exc}")
         print(traceback.format_exc(), flush=True)
         raise gr.Error(str(exc))
 
@@ -3093,6 +3187,7 @@ with gr.Blocks(
 
     group_state = gr.State(value={})
     auto_structure_lines_state = gr.State(value=[])
+    autosplit_context_state = gr.State(value=None)
 
     with gr.Row():
         with gr.Column(scale=1, elem_id="left-rail"):
@@ -3181,10 +3276,20 @@ with gr.Blocks(
                   Uses the uploaded tables, the StructureMap from step 1 and the partition parameters above.
                   Every branch point of the dendrogram is split with HistoSeg from the top down, and its ΔDI is the drop
                   in the CSR deviation index of its clusters (DI in the parent contour minus DI in the child contours).
-                  Branch points with ΔDI at or above the threshold are split. This explores the whole tree and takes a
-                  while on large samples (one HistoSeg partition per branch point).
+                  Then either split every branch point whose ΔDI reaches a threshold, or choose how many structures you
+                  want and split the top-ranked ΔDI branch points (a selected branch point also splits its ancestors).
+                  The exploration runs once (one HistoSeg partition per branch point); 'Re-split' reuses it for other settings.
                 </div>
                 """
+            )
+            autosplit_mode = gr.Radio(
+                label="How to choose the branch points to split",
+                choices=list(AUTOSPLIT_MODE_CHOICES),
+                value="ΔDI threshold",
+            )
+            autosplit_n_structures = gr.Slider(
+                label="Number of structures (used when splitting by number of structures)",
+                minimum=2, maximum=40, step=1, value=5,
             )
             autosplit_threshold = gr.Slider(
                 label="Minimum ΔDI to split a branch point", minimum=0.1, maximum=10.0, step=0.1, value=1.0
@@ -3198,6 +3303,9 @@ with gr.Blocks(
                 label="Monte Carlo simulations per DI test", minimum=19, maximum=99, step=10, value=49
             )
             autosplit_button = gr.Button("3. Split structures automatically by ΔDI", variant="primary")
+            autosplit_resplit_button = gr.Button(
+                "Re-split with the current settings (reuse the ΔDI exploration)", variant="secondary"
+            )
             use_autosplit_button = gr.Button("Use these structures in step 2", variant="secondary")
 
         with gr.Column(scale=1, elem_id="right-rail"):
@@ -3333,6 +3441,8 @@ with gr.Blocks(
             cells_parquet,
             clusters_csv,
             group_state,
+            autosplit_mode,
+            autosplit_n_structures,
             autosplit_threshold,
             autosplit_rule,
             autosplit_n_sim,
@@ -3356,6 +3466,26 @@ with gr.Blocks(
             autosplit_report,
             autosplit_archive,
             autosplit_files,
+            autosplit_context_state,
+        ],
+    )
+
+    autosplit_resplit_button.click(
+        fn=resplit_auto_structure_split,
+        inputs=[autosplit_context_state, autosplit_mode, autosplit_n_structures, autosplit_threshold, autosplit_rule],
+        outputs=[
+            autosplit_status,
+            autosplit_dendrogram,
+            autosplit_partition,
+            autosplit_bars,
+            autosplit_nodes_table,
+            autosplit_clusters_table,
+            autosplit_structures_table,
+            autosplit_lines,
+            autosplit_report,
+            autosplit_archive,
+            autosplit_files,
+            autosplit_context_state,
         ],
     )
 

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from histoseg.spatial_pathologist.auto_split import build_tree, run_auto_split
+from histoseg.spatial_pathologist.auto_split import EXPLORATION_FILE, Exploration, build_tree, run_auto_split
 
 XE = np.linspace(0.0, 200.0, 41)
 YE = np.linspace(0.0, 100.0, 21)
@@ -66,6 +66,25 @@ def test_auto_split_splits_segregated_branches_only(tmp_path, rule):
     for f in result.files:
         assert f.exists()
     assert "ΔDI of every branch point" in result.report_md.read_text(encoding="utf-8")
+
+
+def test_n_structures_mode_and_reusing_the_exploration(tmp_path):
+    cells = _cells()
+    fn = _partition_fn(cells)
+    full = run_auto_split(cells, _structuremap(), fn, tmp_path / "full", mode="n_structures", n_structures=2,
+                          params=QUICK, workers=1, progress=lambda f, m: None)
+    assert sorted(full.structure_lines.splitlines()) in (["A,B", "C,D"], ["A,B", "D,C"], ["B,A", "C,D"], ["B,A", "D,C"])
+    assert (tmp_path / "full" / EXPLORATION_FILE).exists()
+    assert "dDI_rank" in full.nodes
+
+    exploration = Exploration.load(tmp_path / "full" / EXPLORATION_FILE)
+    three = run_auto_split(cells, _structuremap(), fn, tmp_path / "full", mode="n_structures", n_structures=3,
+                           workers=1, progress=lambda f, m: None, exploration=exploration)
+    assert sorted(three.structure_lines.splitlines())[1:] == ["C", "D"]   # top-ranked N2 splits C | D, not A | B
+    assert three.nodes.set_index("node").loc["N1", "dDI"] == full.nodes.set_index("node").loc["N1", "dDI"]
+    four = run_auto_split(cells, _structuremap(), fn, tmp_path / "full", mode="n_structures", n_structures=10,
+                          workers=1, progress=lambda f, m: None, exploration=exploration)
+    assert len(four.structures) == 4                                        # capped at the number of clusters
 
 
 def test_build_tree_rejects_non_ultrametric():
