@@ -104,3 +104,42 @@ HOTSPOT 均来自本结构已分配 cluster，并标记为 `SUBDOMAIN`；其他�
 t_edge=0.60, min_group_share=0.05, min_cells=100, min_share=0.01, max_points=20000`
 
 这些阈值是根据两套数据（GSM9902814 0916、GSM9945415）定的经验值，还没有用人工标注的“好/坏结构”校准。
+
+---
+
+# 自动 ΔDI 结构分割（Serve 步骤 3，`histoseg.spatial_pathologist.auto_split`）
+
+用户选择 ΔDI 阈值后，沿原始 StructureMap 树状图自动划分结构。DI 引擎与上文完全相同
+（Ripley's L 与同一窗口内的 CSR 模拟比较，DI = 20–100 µm 上 L_obs/L_CSR 的平均 − 1），
+划分由 Serve 应用自身的 HistoSeg 分区函数产生，参数与步骤 2 的高级参数一致。
+
+1. **基线：** 每个 cluster 在整个组织中的 DI。
+2. **全树探索：** 从“所有 cluster 为一个结构”开始，每次展开当前最高的分支点 v，用当前所有分支各作一个结构重跑 HistoSeg。
+   - ΔDI(v) = Σ_{v 下的 cluster} [DI(v 的轮廓) − DI(所属子分支的轮廓)]。
+   - DI 只用该 cluster 落在对应轮廓内的细胞计算。
+   - “v 的轮廓”取 v 被切分前一刻的划分重新测量：HistoSeg 划分是竞争性的，其他分支被切分时 v 的轮廓也会移动。
+   - 所有分支点都会被评估。
+3. **按阈值 t 决定（从根开始）：**
+   - ΔDI(v) ≥ t → 切开，继续处理子分支；
+   - ΔDI(v) < t，且下面没有达标分支点 → 保留为一个结构；
+   - ΔDI(v) < t，但下面有分支点 w 达标 → 按用户选择：
+     - **提取贡献最大的子支（默认）：** v 不切，只把 w 的子分支中 ΔDI 贡献（各 cluster ΔDI 之和）最大的那一支单独成结构；
+     - **连带切开父分支：** v 也切开并继续递归；
+     - **停止：** v 保留，忽略 w。
+4. **最终划分：** 用得到的结构重跑 HistoSeg，并计算每个 cluster 在最终轮廓中的 DI。
+
+## 输出（`autosplit_*`）
+| 文件 | 内容 |
+|---|---|
+| `autosplit_report.md` | 报告：最终结构、每个分支点 ΔDI 与判定、提取的分支、每个 cluster 分割前（整个组织）/后（最终结构）的 DI、每个分支点切分时各 cluster 的前后 DI |
+| `autosplit_branch_points.csv` | 每个分支点：高度、子分支、Σ DI 前/后、ΔDI、判定、原因 |
+| `autosplit_branch_point_cluster_DI.csv` | 每个分支点切分时每个 cluster 的 DI 前/后与 ΔDI |
+| `autosplit_cluster_DI_before_after.csv` | 每个 cluster：整个组织 DI、最终结构 DI、ΔDI、落在自身轮廓内的比例 |
+| `autosplit_structures.csv`, `autosplit_histoseg_structures.txt` | 最终结构（每行一个，可直接用于步骤 2） |
+| `autosplit_extracted_branches.csv` | 被提取的子分支及各子支贡献 |
+| `autosplit_dendrogram.png`, `autosplit_partition.png` | 标注 ΔDI 与判定的树状图；最终结构的空间划分 |
+
+## 运行时间
+- **工作量：** 每个分支点需要 1 次 HistoSeg 划分，外加该分支点下 cluster 数 × 2 次 DI 检验。
+- **并行数：** 默认 `min(2, CPU)` 个并行进程，可用环境变量 `HISTOSEG_QC_WORKERS` 调整。
+- **加速：** 大样本可降低 Monte Carlo 次数（界面滑块，最小 19）。

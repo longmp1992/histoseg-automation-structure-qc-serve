@@ -11,7 +11,12 @@ two Xenium-derived input tables rather than from a precomputed HistoSeg ZIP:
 4. generate non-overlapping HistoSeg structure contours;
 5. automatically run fixed-window CSR and random-labelling QC;
 6. download PASS/PARTIAL/FAIL calls, assigned-cluster HOTSPOT calls, and tree-consistent
-   `cluster_ids` split suggestions with all ordinary HistoSeg outputs.
+   `cluster_ids` split suggestions with all ordinary HistoSeg outputs;
+7. optionally, split structures automatically: every StructureMap branch point is split with
+   HistoSeg from the top down, its ΔDI (drop of the CSR deviation index of its clusters) is
+   measured, and the tree is cut at a user-chosen ΔDI threshold. The report lists the ΔDI of
+   every branch point and the DI of every cluster before (whole tissue) and after (final
+   structure); the resulting structures can be sent straight to the contour step.
 
 The complete CSR method and thresholds are documented in
 [`STRUCTURE_QC_ALGORITHM.md`](STRUCTURE_QC_ALGORITHM.md). The container image is

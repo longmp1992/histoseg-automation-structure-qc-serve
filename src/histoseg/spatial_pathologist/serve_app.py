@@ -66,6 +66,7 @@ from histoseg.spatial_pathologist.structure_qc import (
     PARAMS as STRUCTURE_QC_PARAMS,
     run as run_structure_qc,
 )
+from histoseg.spatial_pathologist.auto_split import run_auto_split
 
 try:
     import pyarrow.parquet as pq
@@ -2430,6 +2431,225 @@ def run_analysis(
         raise gr.Error(str(exc))
 
 
+AUTOSPLIT_RULE_CHOICES = {
+    "Keep the parent, extract only the top-ΔDI child branch": "extract_top_branch",
+    "Split the parent as well": "split_parent",
+    "Keep the parent, ignore branch points below it": "stop",
+}
+AUTOSPLIT_NODE_COLUMNS = ["Branch point", "Height", "Children", "Σ DI before", "Σ DI after", "ΔDI", "≥ threshold",
+                          "Decision", "Reason"]
+AUTOSPLIT_CLUSTER_COLUMNS = ["Cluster", "Final structure", "Cells", "DI before (whole tissue)", "DI after (final)",
+                             "ΔDI", "Fraction in own contour"]
+AUTOSPLIT_STRUCTURE_COLUMNS = ["Structure", "Cluster IDs", "Source", "Kind", "Cells", "Σ DI before", "Σ DI after",
+                               "Max DI after"]
+
+
+def _autosplit_workers() -> int:
+    env = os.environ.get("HISTOSEG_QC_WORKERS", "")
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    return max(1, min(2, os.cpu_count() or 1))
+
+
+def _row_coph_from_group_state(group_state: dict[str, object] | None, clusters: set[str]) -> pd.DataFrame | None:
+    if not group_state:
+        return None
+    labels = [_normalize_cluster_label(item) for item in group_state.get("row_coph_labels", [])]
+    values = group_state.get("row_coph_values")
+    if not labels or values is None or set(labels) != clusters:
+        return None
+    return pd.DataFrame(np.asarray(values, dtype=float), index=labels, columns=labels)
+
+
+def _round_or_blank(value: object, digits: int = 2) -> object:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return "" if np.isnan(number) else round(number, digits)
+
+
+def run_auto_structure_split(
+    cells_parquet: object | None,
+    clusters_csv: object | None,
+    group_state: dict[str, object] | None,
+    min_ddi: float,
+    descendant_rule_label: str,
+    n_sim: int,
+    grid_n: int,
+    knn_k: int,
+    smooth_sigma: float,
+    min_cells_inside: int,
+    bbox_expand_um: float,
+    syn_bg_density: float,
+    use_synth_bg: bool,
+    progress: gr.Progress = gr.Progress(track_tqdm=False),
+):
+    """Step 3: explore every StructureMap branch point with HistoSeg + CSR DI and cut the tree at a ΔDI threshold."""
+    if HISTOSEG_IMPORT_ERROR is not None:
+        raise gr.Error(f"HistoSeg could not be imported inside the app container. Import error: {HISTOSEG_IMPORT_ERROR}")
+    try:
+        removed_runs = cleanup_old_runs(max_keep=2)
+        run_dir = build_run_dir()
+        upload_dir = run_dir / "inputs"
+        out_dir = run_dir / "autosplit"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        progress(0.01, desc="Staging uploaded files")
+        cells_path, clusters_path, _unused = resolve_inputs(
+            cells_upload=cells_parquet, clusters_upload=clusters_csv, tissue_upload=None, target_dir=upload_dir
+        )
+        merged, _id_col, x_col, y_col = prepare_merged_clusters(cells_path, clusters_path)
+        clusters_present = set(merged["cluster"].unique())
+        if len(clusters_present) < 2:
+            raise ValueError("Need at least two clusters to split.")
+
+        row_coph = _row_coph_from_group_state(group_state, clusters_present)
+        structuremap_source = "StructureMap from step 1"
+        if row_coph is None:
+            progress(0.02, desc="Computing the StructureMap (step 1 was not run for these files)")
+            distance_matrix = compute_searcher_findee_distance_matrix_from_df(
+                merged, x_col=x_col, y_col=y_col, z_col=None, celltype_col="cluster"
+            )
+            row_coph, _col_coph = compute_cophenetic_from_distance_matrix(distance_matrix, method="average", show_corr=False)
+            row_coph = normalize_row_cophenetic(row_coph)
+            structuremap_source = "StructureMap computed for this run"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        row_coph.to_csv(out_dir / "cophenetic_heatmap_row_coph.csv", index_label="cluster")
+
+        isoline_cfg = {
+            **DEFAULT_STRUCTURE_ISOLINE_CFG,
+            "bins_x": int(grid_n),
+            "bins_y": int(knn_k),
+            "gaussian_sigma": float(smooth_sigma),
+            "min_cells": int(min_cells_inside),
+            "min_dominance": float(bbox_expand_um),
+            "support_quantile": float(syn_bg_density),
+            "fill_holes": bool(use_synth_bg),
+        }
+        base_cells = merged[[x_col, y_col, "cluster"]].copy()
+        cluster_values = base_cells["cluster"].to_numpy()
+
+        def partition_fn(groups: list[list[str]]):
+            specs, selected = [], np.zeros(len(base_cells), dtype=int)
+            for gid, group in enumerate(groups, start=1):
+                specs.append(
+                    {
+                        "structure_id": gid,
+                        "structure_name": f"Structure {gid}",
+                        "structure_color": group_color(gid),
+                        "cluster_ids_raw": list(group),
+                        "cluster_ids_normalized": list(group),
+                    }
+                )
+                selected[np.isin(cluster_values, list(group))] = gid
+            frame = base_cells.copy()
+            frame["_selected_structure_id"] = selected
+            _contours, partition_data, _metrics = build_structure_isolines(
+                cells=frame, structure_specs=specs, x_col=x_col, y_col=y_col, isoline_cfg=isoline_cfg
+            )
+            assigned, _assign_metrics = assign_cells_to_partition(
+                cells=frame, partition_data=partition_data, structure_specs=specs, x_col=x_col, y_col=y_col
+            )
+            return (
+                partition_data["partition_labels"],
+                partition_data["x_edges"],
+                partition_data["y_edges"],
+                assigned["isoline_structure_id"].to_numpy(),
+            )
+
+        rule = AUTOSPLIT_RULE_CHOICES.get(str(descendant_rule_label), "extract_top_branch")
+        workers = _autosplit_workers()
+        n_clusters = len(clusters_present)
+        log_event(
+            f"Auto split | clusters={n_clusters} | threshold={float(min_ddi):g} | rule={rule} | "
+            f"n_sim={int(n_sim)} | workers={workers}"
+        )
+
+        def report_progress(frac: float, message: str) -> None:
+            progress(0.03 + 0.94 * float(frac), desc=message)
+            log_event(f"Auto split | {message}")
+
+        result = run_auto_split(
+            base_cells,
+            row_coph,
+            partition_fn,
+            out_dir,
+            min_ddi=float(min_ddi),
+            descendant_rule=rule,
+            params={**STRUCTURE_QC_PARAMS, "n_sim": int(n_sim)},
+            workers=workers,
+            x_col=x_col,
+            y_col=y_col,
+            progress=report_progress,
+        )
+        progress(0.98, desc="Packaging outputs")
+        archive_path = Path(shutil.make_archive(str(run_dir / "autosplit_outputs"), "zip", root_dir=out_dir))
+
+        nodes_table = pd.DataFrame(
+            [
+                [row.node, round(row.height, 3), row.children, _round_or_blank(row.sum_DI_before),
+                 _round_or_blank(row.sum_DI_after), _round_or_blank(row.dDI), "yes" if row.passes_threshold else "no",
+                 row.decision, row.reason]
+                for row in result.nodes.itertuples()
+            ],
+            columns=AUTOSPLIT_NODE_COLUMNS,
+        )
+        clusters_table = pd.DataFrame(
+            [
+                [f"C{row.cluster}", row.final_structure, int(row.n_cells), _round_or_blank(row.DI_before_tissue),
+                 _round_or_blank(row.DI_after_final), _round_or_blank(row.dDI), f"{row.frac_in_own_contour:.0%}"]
+                for row in result.clusters.sort_values("DI_before_tissue", ascending=False).itertuples()
+            ],
+            columns=AUTOSPLIT_CLUSTER_COLUMNS,
+        )
+        structures_table = pd.DataFrame(
+            [
+                [row.structure_name, row.cluster_ids, row.source, row.kind, int(row.n_cells),
+                 _round_or_blank(row.sum_DI_before_tissue), _round_or_blank(row.sum_DI_after_final),
+                 _round_or_blank(row.max_DI_after_final)]
+                for row in result.structures.itertuples()
+            ],
+            columns=AUTOSPLIT_STRUCTURE_COLUMNS,
+        )
+        status_lines = [
+            "Automatic ΔDI split finished.",
+            f"Run directory: {run_dir}",
+            f"{structuremap_source}; {n_clusters} clusters, {len(result.nodes)} branch points explored.",
+            f"Threshold ΔDI ≥ {float(min_ddi):g}; rule: {descendant_rule_label}.",
+            f"Structures: {len(result.structures)}; Σ DI {result.sum_di_baseline:.2f} (whole tissue) -> "
+            f"{result.sum_di_final:.2f} (final structures).",
+            "Click 'Use these structures' to copy them into the cluster-ID box, then run step 2 to draw the contours.",
+        ]
+        if removed_runs:
+            status_lines.append(f"Cleaned old run directories: {', '.join(removed_runs)}")
+        progress(1.0, desc="Automatic split finished")
+        return (
+            "\n".join(status_lines),
+            str(result.dendrogram_png),
+            str(result.partition_png),
+            nodes_table,
+            clusters_table,
+            structures_table,
+            result.structure_lines,
+            result.report_md.read_text(encoding="utf-8"),
+            str(archive_path),
+            [str(path) for path in result.files],
+        )
+    except Exception as exc:
+        log_event(f"Auto split failed: {exc}")
+        print(traceback.format_exc(), flush=True)
+        raise gr.Error(str(exc))
+
+
+def use_autosplit_structures(structure_lines: str):
+    if not str(structure_lines or "").strip():
+        raise gr.Error("Run the automatic ΔDI split first.")
+    return str(structure_lines).strip(), [], (
+        "The automatically split structures were copied into the cluster-ID box (one structure per line). "
+        "Click '2. Run HistoSeg contours + CSR QC' to draw their contours."
+    )
+
+
 CUSTOM_CSS = """
 :root {
   --app-bg: #07111d;
@@ -2681,7 +2901,7 @@ gradio-app {
 
 .guide-shell {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 14px;
   margin-bottom: 18px;
 }
@@ -2748,14 +2968,17 @@ gradio-app {
 
 #structure-selector,
 #cophenetic-preview,
-#contour-preview {
+#contour-preview,
+#autosplit-dendrogram,
+#autosplit-partition {
   border-radius: 20px !important;
   overflow: hidden;
 }
 
 #selection-summary textarea,
 #dendrogram-status textarea,
-#run-status textarea {
+#run-status textarea,
+#autosplit-status textarea {
   min-height: 112px !important;
 }
 
@@ -2853,6 +3076,11 @@ with gr.Blocks(
             <h3>Generate contours and validate them</h3>
             <p>The final run writes the contours, then compares each structure and only its assigned clusters against matched spatial null models. Foreign and unassigned clusters are excluded. You receive PASS/PARTIAL/FAIL calls, assigned-cluster HOTSPOT calls, and tree-consistent split suggestions.</p>
           </div>
+          <div class="guide-card">
+            <div class="guide-step">Step 5 (optional)</div>
+            <h3>Split structures automatically by ΔDI</h3>
+            <p>Every dendrogram branch point is split with HistoSeg in turn, and the drop in the CSR deviation index (ΔDI) of its clusters is measured. Choose a ΔDI threshold: branch points that reach it are split, and the resulting structures can be sent straight to step 2.</p>
+          </div>
         </div>
         <div class="app-note">
           <strong>What this app is for.</strong> It starts before HistoSeg contour generation; do not upload a
@@ -2945,6 +3173,32 @@ with gr.Blocks(
 
             run_button = gr.Button("2. Run HistoSeg contours + CSR QC", variant="primary")
 
+            gr.HTML(
+                """
+                <div class="micro-guide">
+                  <strong>Step 3 (optional) - automatic structure split by ΔDI.</strong>
+                  Uses the uploaded tables, the StructureMap from step 1 and the partition parameters above.
+                  Every branch point of the dendrogram is split with HistoSeg from the top down, and its ΔDI is the drop
+                  in the CSR deviation index of its clusters (DI in the parent contour minus DI in the child contours).
+                  Branch points with ΔDI at or above the threshold are split. This explores the whole tree and takes a
+                  while on large samples (one HistoSeg partition per branch point).
+                </div>
+                """
+            )
+            autosplit_threshold = gr.Slider(
+                label="Minimum ΔDI to split a branch point", minimum=0.1, maximum=10.0, step=0.1, value=1.0
+            )
+            autosplit_rule = gr.Dropdown(
+                label="When a branch point is below the threshold but a branch point under it passes",
+                choices=list(AUTOSPLIT_RULE_CHOICES),
+                value="Keep the parent, extract only the top-ΔDI child branch",
+            )
+            autosplit_n_sim = gr.Slider(
+                label="Monte Carlo simulations per DI test", minimum=19, maximum=99, step=10, value=49
+            )
+            autosplit_button = gr.Button("3. Split structures automatically by ΔDI", variant="primary")
+            use_autosplit_button = gr.Button("Use these structures in step 2", variant="secondary")
+
         with gr.Column(scale=1, elem_id="right-rail"):
             structure_status = gr.Textbox(label="Step 1 status", lines=6, elem_id="dendrogram-status")
             structure_selector_image = gr.Image(
@@ -2987,6 +3241,32 @@ with gr.Blocks(
                 interactive=False,
                 wrap=True,
             )
+            autosplit_status = gr.Textbox(label="Step 3 status (automatic ΔDI split)", lines=7, elem_id="autosplit-status")
+            autosplit_dendrogram = gr.Image(
+                label="ΔDI of every branch point", type="filepath", interactive=False, sources=[],
+                elem_id="autosplit-dendrogram",
+            )
+            autosplit_partition = gr.Image(
+                label="HistoSeg partition of the split structures", type="filepath", interactive=False, sources=[],
+                elem_id="autosplit-partition",
+            )
+            autosplit_structures_table = gr.Dataframe(
+                label="Automatically split structures", headers=AUTOSPLIT_STRUCTURE_COLUMNS, interactive=False, wrap=True
+            )
+            autosplit_nodes_table = gr.Dataframe(
+                label="ΔDI of every branch point", headers=AUTOSPLIT_NODE_COLUMNS, interactive=False, wrap=True
+            )
+            autosplit_clusters_table = gr.Dataframe(
+                label="DI of every cluster before (whole tissue) and after (final structure)",
+                headers=AUTOSPLIT_CLUSTER_COLUMNS, interactive=False, wrap=True,
+            )
+            autosplit_lines = gr.Textbox(
+                label="Split structures (one per line, HistoSeg cluster-ID format)", lines=6, interactive=False
+            )
+            with gr.Accordion("Automatic split report (includes per-cluster DI at every branch point)", open=False):
+                autosplit_report = gr.Markdown()
+            autosplit_archive = gr.File(label="Download automatic split outputs as ZIP", file_count="single")
+            autosplit_files = gr.File(label="Automatic split files", file_count="multiple")
 
     build_groups_button.click(
         fn=build_structure_groups,
@@ -3040,6 +3320,43 @@ with gr.Blocks(
             qc_structures_table,
             qc_clusters_table,
         ],
+    )
+
+    autosplit_button.click(
+        fn=run_auto_structure_split,
+        inputs=[
+            cells_parquet,
+            clusters_csv,
+            group_state,
+            autosplit_threshold,
+            autosplit_rule,
+            autosplit_n_sim,
+            grid_n,
+            knn_k,
+            smooth_sigma,
+            min_cells_inside,
+            bbox_expand_um,
+            syn_bg_density,
+            use_synth_bg,
+        ],
+        outputs=[
+            autosplit_status,
+            autosplit_dendrogram,
+            autosplit_partition,
+            autosplit_nodes_table,
+            autosplit_clusters_table,
+            autosplit_structures_table,
+            autosplit_lines,
+            autosplit_report,
+            autosplit_archive,
+            autosplit_files,
+        ],
+    )
+
+    use_autosplit_button.click(
+        fn=use_autosplit_structures,
+        inputs=[autosplit_lines],
+        outputs=[pattern1_clusters, structure_group_selector, selection_summary],
     )
 
 
