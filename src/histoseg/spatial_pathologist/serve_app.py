@@ -2444,8 +2444,8 @@ AUTOSPLIT_MODE_CHOICES = {
 }
 AUTOSPLIT_NODE_COLUMNS = ["Branch point", "ΔDI rank", "Height", "Children", "Σ DI before", "Σ DI after", "ΔDI",
                           "Decision", "Reason"]
-AUTOSPLIT_CLUSTER_COLUMNS = ["Cluster", "Final structure", "Cells", "DI before (whole tissue)", "DI after (final)",
-                             "ΔDI", "Fraction in own contour"]
+AUTOSPLIT_CLUSTER_COLUMNS = ["Cluster", "Final structure", "Cells", "DI before (whole tissue)", "p before",
+                             "DI after (final)", "p after", "ΔDI", "Fraction in own contour"]
 AUTOSPLIT_STRUCTURE_COLUMNS = ["Structure", "Cluster IDs", "Source", "Kind", "Cells", "Σ DI before", "Σ DI after",
                                "Max DI after"]
 
@@ -2533,7 +2533,8 @@ def _autosplit_outputs(result, run_dir: Path, header_lines: list[str], context: 
     clusters_table = pd.DataFrame(
         [
             [f"C{row.cluster}", row.final_structure, int(row.n_cells), _round_or_blank(row.DI_before_tissue),
-             _round_or_blank(row.DI_after_final), _round_or_blank(row.dDI), f"{row.frac_in_own_contour:.0%}"]
+             _round_or_blank(row.p_before_tissue), _round_or_blank(row.DI_after_final),
+             _round_or_blank(row.p_after_final), _round_or_blank(row.dDI), f"{row.frac_in_own_contour:.0%}"]
             for row in result.clusters.sort_values("DI_before_tissue", ascending=False).itertuples()
         ],
         columns=AUTOSPLIT_CLUSTER_COLUMNS,

@@ -421,11 +421,13 @@ def run(input_path: Path, out_dir: Path, P: dict, workers: int, structuremap: Pa
         di_final = final["DI"] if final is not None else np.nan
         before_after.append(dict(cluster=c, structure_id=sid, structure_name=specs[sid]["structure_name"],
                                  n_cells=n_c, n_in_own_structure=n_in, frac_in_own_structure=n_in / max(n_c, 1),
-                                 DI_original_tissue=orig["DI"], DI_final_structure=di_final,
+                                 DI_original_tissue=orig["DI"], p_original_tissue=orig["p_clustered"],
+                                 DI_final_structure=di_final,
+                                 p_final_structure=final["p_clustered"] if final is not None else np.nan,
                                  dDI=orig["DI"] - di_final))
     before_after = pd.DataFrame(before_after, columns=[
         "cluster", "structure_id", "structure_name", "n_cells", "n_in_own_structure", "frac_in_own_structure",
-        "DI_original_tissue", "DI_final_structure", "dDI"])
+        "DI_original_tissue", "p_original_tissue", "DI_final_structure", "p_final_structure", "dDI"])
     before_after.to_csv(out_dir / "qc_cluster_DI_before_after.csv", index=False)
 
     # structures and split suggestions (dendrogram of the original StructureMap)
@@ -523,8 +525,22 @@ def _cluster_sort_key(c):
     return (0, int(s), s) if s.isdigit() else (1, 0, s)
 
 
-def plot_cluster_di_before_after(ax, table, before_col, after_col, group_col, title):
-    """Grouped bars: DI of every cluster in the original tissue vs in its final structure."""
+def _p_text(p, alpha=0.05):
+    try:
+        value = float(p)
+    except (TypeError, ValueError):
+        return "—"
+    if np.isnan(value):
+        return "—"
+    return f"{value:.2f}" + (" (n.s.)" if value > alpha else "")
+
+
+def plot_cluster_di_before_after(ax, table, before_col, after_col, group_col, title,
+                                 before_p_col=None, after_p_col=None, alpha=0.05):
+    """Grouped bars: DI of every cluster in the original tissue vs in its final structure.
+
+    Bars whose one-sided clustering test is not significant (p > alpha) are marked "n.s.".
+    """
     t = table.reset_index(drop=True)
     x, pos, prev, sep = [], 0.0, None, []
     for g in t[group_col]:
@@ -543,6 +559,13 @@ def plot_cluster_di_before_after(ax, table, before_col, after_col, group_col, ti
     for xi, a in zip(x, after):
         if np.isnan(a):
             ax.text(xi + w / 2, 0, "n/a", ha="center", va="bottom", fontsize=6, color="#6b6a64", rotation=90)
+    for col, xs, values in ((before_p_col, x - w / 2, before), (after_p_col, x + w / 2, after)):
+        if col is None or col not in t:
+            continue
+        for xi, value, p in zip(xs, values, t[col].to_numpy(float)):
+            if np.isnan(value) or np.isnan(p) or p <= alpha:
+                continue
+            ax.text(xi, max(value, 0), "n.s.", ha="center", va="bottom", fontsize=6.5, color="#6b6a64", zorder=4)
     ax.axhline(0, color="#6b6a64", lw=1)
     ax.axhline(0.3, color="#d03b3b", lw=1, ls="--", zorder=2)
     for s in sep:
@@ -589,12 +612,16 @@ def write_report(out_dir, input_path, sdf, cdf, suggestions, P, win_source, matc
                  f"{r.DI_csr:.2f} | {r.DI_rl:.2f} | {r.CE_R_csr:.2f} | {r.edge_ratio:.2f} | {r.status} | {role_zh.get(r.role, '')} |")
     if before_after is not None and len(before_after):
         L += ["", "## 每个 cluster 的 DI：原始（整个组织）vs 最终（所属结构内）", "",
-              "| 结构 | Cluster | 细胞数 | 落在所属结构内 | DI 原始 | DI 最终 | ΔDI |", "|---|---|---|---|---|---|---|"]
+              f"p 为单侧聚集检验（{P['n_sim']} 次 Monte Carlo，最小 {1 / (P['n_sim'] + 1):.2f}）；"
+              f"p > {P['alpha']:g} 记为 n.s.", "",
+              "| 结构 | Cluster | 细胞数 | 落在所属结构内 | DI 原始 | p 原始 | DI 最终 | p 最终 | ΔDI |",
+              "|---|---|---|---|---|---|---|---|---|"]
         for r in before_after.itertuples():
             fin = "—" if pd.isna(r.DI_final_structure) else f"{r.DI_final_structure:.2f}"
             dd = "—" if pd.isna(r.dDI) else f"{r.dDI:.2f}"
             L.append(f"| {r.structure_name} | C{r.cluster} | {r.n_cells:,} | {r.frac_in_own_structure:.0%} | "
-                     f"{r.DI_original_tissue:.2f} | {fin} | {dd} |")
+                     f"{r.DI_original_tissue:.2f} | {_p_text(r.p_original_tissue, P['alpha'])} | {fin} | "
+                     f"{_p_text(r.p_final_structure, P['alpha'])} | {dd} |")
     L += ["", "## 分割建议", ""]
     for s in suggestions:
         L.append(f"### {s['structure_name']} — {zh[s['verdict']]} / {zh[s['split']]}")
@@ -680,7 +707,9 @@ def plot_overview(out_dir, sdf, cdf, P, before_after=None):
         ax3 = fig.add_subplot(gs[2])
         plot_cluster_di_before_after(
             ax3, before_after, "DI_original_tissue", "DI_final_structure", "structure_name",
-            "DI of every cluster: original (whole tissue) vs final (inside its assigned structure); dashed = 0.3")
+            "DI of every cluster: original (whole tissue) vs final (inside its assigned structure); dashed = 0.3; "
+            f"n.s. = clustering not significant (p > {P['alpha']:g})",
+            before_p_col="p_original_tissue", after_p_col="p_final_structure", alpha=P["alpha"])
     fig.tight_layout()
     fig.savefig(out_dir / "qc_overview.png", dpi=170, bbox_inches="tight")
     plt.close(fig)

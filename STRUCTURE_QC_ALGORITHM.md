@@ -98,7 +98,7 @@ HOTSPOT 均来自本结构已分配 cluster，并标记为 `SUBDOMAIN`；其他�
 | `qc_split_suggestions.json` | 机器可读的建议：树切分分支、新 `cluster_ids`、外来岛、边界溢入 |
 | `qc_tests.csv`, `qc_L_ratio_curves.csv` | 全部检验结果与 L 比值曲线 |
 | `partition_labels.npz` | 所用窗口栅格 |
-| `qc_cluster_DI_before_after.csv` | 每个已分配 cluster：原始 DI（全部细胞、整个组织）与最终 DI（所属结构轮廓内）；`qc_overview.png` 底部为对应的分组柱状图 |
+| `qc_cluster_DI_before_after.csv` | 每个已分配 cluster：原始 DI（全部细胞、整个组织）与最终 DI（所属结构轮廓内），各附单侧聚集检验 p 值；`qc_overview.png` 底部为对应的分组柱状图，p > alpha 的柱标注 n.s. |
 
 ## 默认阈值（均可调）
 `n_sim=49, r=[20,100] µm, t_homog_pass=0.10, t_homog_partial=0.30, t_hotspot=0.30, t_mild=0.15,

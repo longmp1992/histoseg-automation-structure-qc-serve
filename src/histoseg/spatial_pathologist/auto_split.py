@@ -42,7 +42,8 @@ from scipy.cluster.hierarchy import dendrogram, linkage, to_tree
 from scipy.spatial.distance import squareform
 
 from .structure_qc import PARAMS as QC_PARAMS
-from .structure_qc import _L_nnd, _cluster_sort_key, _norm_label, _uniform_in_mask, plot_cluster_di_before_after
+from .structure_qc import (_L_nnd, _cluster_sort_key, _norm_label, _p_text, _uniform_in_mask,
+                            plot_cluster_di_before_after)
 
 DESCENDANT_RULES = ("extract_top_branch", "split_parent", "stop")
 PartitionFn = Callable[[list[list[str]]], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
@@ -167,6 +168,7 @@ class Exploration:
     long: pd.DataFrame
     contrib: dict[str, pd.Series]
     params: dict[str, Any]
+    baseline_p: pd.Series | None = None
 
     def save(self, path: Path) -> Path:
         with open(path, "wb") as fh:
@@ -207,6 +209,7 @@ def explore_tree(
     jobs = [(f"tissue|C{c}", np.flatnonzero(cl_arr == c), "tissue") for c in M.index]
     res = _run_jobs(jobs, tissue_labels, xe_t, ye_t, xy, P, workers)
     baseline = pd.Series({c: res[f"tissue|C{c}"]["DI"] for c in M.index}, name="DI_baseline_tissue")
+    baseline_p = pd.Series({c: res[f"tissue|C{c}"]["p_clustered"] for c in M.index}, name="p_baseline_tissue")
     current = baseline.copy()
 
     # The partition is competitive: a group's contour moves when other groups are split. "Before" is therefore
@@ -262,7 +265,8 @@ def explore_tree(
                               dDI=float(np.nansum(list(d.values())))))
     nodes = pd.DataFrame(node_rows)
     nodes["dDI_rank"] = nodes.dDI.rank(ascending=False, method="first").astype(int)
-    return Exploration(M=M, baseline=baseline, nodes=nodes, long=pd.DataFrame(long_rows), contrib=contrib, params=P)
+    return Exploration(M=M, baseline=baseline, nodes=nodes, long=pd.DataFrame(long_rows), contrib=contrib, params=P,
+                       baseline_p=baseline_p)
 
 
 def _decide_threshold(info, root, ddi, contrib, min_ddi, descendant_rule):
@@ -390,6 +394,7 @@ def cut_tree(
     out_dir.mkdir(parents=True, exist_ok=True)
     ex = exploration
     P, M, baseline = ex.params, ex.M, ex.baseline
+    baseline_p = ex.baseline_p if ex.baseline_p is not None else pd.Series(np.nan, index=baseline.index)
     cl_arr = cells["cluster"].map(_norm_label).to_numpy().astype(str)
     xy = cells[[x_col, y_col]].to_numpy(float)
     Z, root, info = build_tree(M)
@@ -424,7 +429,8 @@ def cut_tree(
             r = res[f"final|C{c}"]
             n_c = int((cl_arr == c).sum())
             crow.append(dict(cluster=c, final_structure=f"Structure {gid}", n_cells=n_c,
-                             DI_before_tissue=float(baseline[c]), DI_after_final=r["DI"],
+                             DI_before_tissue=float(baseline[c]), p_before_tissue=float(baseline_p[c]),
+                             DI_after_final=r["DI"], p_after_final=r["p_clustered"],
                              dDI=float(baseline[c]) - r["DI"], p_clustered_after=r["p_clustered"],
                              frac_in_own_contour=r["n_cells"] / max(n_c, 1)))
     clusters = pd.DataFrame(crow)
@@ -564,16 +570,22 @@ def _write_report(out_dir, nodes, long, clusters, structures, extracted, lines, 
         for r in extracted.itertuples():
             L.append(f"| {r.parent} | {_f(r.parent_dDI)} | {r.qualifying_descendant} | {_f(r.descendant_dDI)} | "
                      f"{{{r.extracted_clusters}}} | {r.branch_contributions} |")
+    alpha = P.get("alpha", 0.05)
     L += ["", "## DI of every cluster before (whole tissue) and after (final structure)", "",
-          "| Cluster | Final structure | Cells | DI before | DI after | ΔDI | Fraction in own contour |",
-          "|---|---|---|---|---|---|---|"]
+          f"p: one-sided clustering test ({P['n_sim']} Monte Carlo simulations, minimum {1 / (P['n_sim'] + 1):.2f}); "
+          f"n.s. = p > {alpha:g}", "",
+          "| Cluster | Final structure | Cells | DI before | p before | DI after | p after | ΔDI | Fraction in own contour |",
+          "|---|---|---|---|---|---|---|---|---|"]
     for r in clusters.sort_values("DI_before_tissue", ascending=False).itertuples():
         L.append(f"| C{r.cluster} | {r.final_structure} | {r.n_cells:,} | {_f(r.DI_before_tissue)} | "
-                 f"{_f(r.DI_after_final)} | {_f(r.dDI)} | {r.frac_in_own_contour:.0%} |")
+                 f"{_p_text(r.p_before_tissue, alpha)} | {_f(r.DI_after_final)} | {_p_text(r.p_after_final, alpha)} | "
+                 f"{_f(r.dDI)} | {r.frac_in_own_contour:.0%} |")
     L += ["", "## DI of each cluster at every branch-point split", "",
-          "| Branch point | Cluster | Child branch | DI before | DI after | ΔDI |", "|---|---|---|---|---|---|"]
+          "| Branch point | Cluster | Child branch | DI before | DI after | p after | ΔDI |",
+          "|---|---|---|---|---|---|---|"]
     for r in long.itertuples():
-        L.append(f"| {r.node} | C{r.cluster} | {r.child_branch} | {_f(r.DI_before)} | {_f(r.DI_after)} | {_f(r.dDI)} |")
+        L.append(f"| {r.node} | C{r.cluster} | {r.child_branch} | {_f(r.DI_before)} | {_f(r.DI_after)} | "
+                 f"{_p_text(r.p_clustered_after, alpha)} | {_f(r.dDI)} |")
     L += ["", "Notes: ΔDI of a branch point is evaluated during a full top-down exploration (HistoSeg is re-run after "
           "every split); DI is computed on the cells of each cluster that fall inside its own contour."]
     path = Path(out_dir) / "autosplit_report.md"
@@ -634,7 +646,8 @@ def _plot_before_after(out_dir, clusters: pd.DataFrame) -> Path:
     fig, ax = plt.subplots(figsize=(max(9, 0.45 * len(t) + 3), 4.2))
     plot_cluster_di_before_after(ax, t, "DI_before_tissue", "DI_after_final", "final_structure",
                                  "DI of every cluster: original (whole tissue) vs final (inside its split structure); "
-                                 "dashed = 0.3")
+                                 "dashed = 0.3; n.s. = clustering not significant",
+                                 before_p_col="p_before_tissue", after_p_col="p_after_final")
     fig.tight_layout()
     path = Path(out_dir) / "autosplit_cluster_DI_before_after.png"
     fig.savefig(path, dpi=160, bbox_inches="tight")
